@@ -1,0 +1,562 @@
+// This module only creates fresh fakes inside its factory functions, never
+// module-level shared ones, so consumers never need their history reset from
+// the outside. They are deliberately created on the sinon singleton: a per-file
+// sandbox would accumulate thousands of factory-built fakes over the suite and
+// make every resetHistory() pass over them (nothing ever iterates the
+// singleton's collection).
+// eslint-disable-next-line no-restricted-syntax
+const { fake } = require('sinon');
+
+const ExternalIntegration = require('../../../lib/external-integration');
+const Calendar = require('../../../lib/calendar');
+const StateManager = require('../../../lib/state');
+const Variable = require('../../../lib/variable');
+const { Cache } = require('../../../utils/cache');
+const db = require('../../../models');
+const { generateIntegrationToken } = require('../../../utils/integrationToken');
+const { SERVICE_STATUS, SERVICE_TYPES } = require('../../../utils/constants');
+
+const TEST_JWT_SECRET = 'secret';
+
+const TEST_MANIFEST = {
+  manifest_version: 1,
+  type: 'device',
+  name: 'Open-Meteo Demo',
+  description: {
+    en: 'Weather sensor and virtual switch demo integration.',
+    fr: 'Intégration démo : capteur météo et interrupteur virtuel.',
+  },
+  version: '1.2.0',
+  docker_image: 'ghcr.io/john/gladys-open-meteo-demo:1.2.0',
+  gladys_version: '>=4.62.0',
+  cover_image: 'https://raw.githubusercontent.com/john/gladys-open-meteo-demo/main/cover.jpg',
+  config_schema: [
+    {
+      key: 'latitude',
+      type: 'number',
+      label: { en: 'Latitude', fr: 'Latitude' },
+      required: true,
+      default: 48.85,
+      min: -90,
+      max: 90,
+    },
+    {
+      key: 'api_key',
+      type: 'secret',
+      label: { en: 'API key', fr: "Clé d'API" },
+      required: false,
+    },
+    {
+      key: 'unit',
+      type: 'select',
+      label: { en: 'Unit', fr: 'Unité' },
+      default: 'celsius',
+      options: [
+        { value: 'celsius', label: { en: 'Celsius', fr: 'Celsius' } },
+        { value: 'fahrenheit', label: { en: 'Fahrenheit', fr: 'Fahrenheit' } },
+      ],
+    },
+    {
+      key: 'name',
+      type: 'string',
+      label: { en: 'Name' },
+    },
+    {
+      key: 'enabled',
+      type: 'boolean',
+      label: { en: 'Enabled' },
+    },
+  ],
+};
+
+// Communication-type fixture: a messaging channel (Telegram-like bot), no
+// device screens, the user links their account with a short code.
+const TEST_COMMUNICATION_MANIFEST = {
+  manifest_version: 1,
+  type: 'communication',
+  name: 'Signal Bridge Demo',
+  description: {
+    en: 'Signal messaging channel demo integration.',
+    fr: 'Intégration démo : canal de messagerie Signal.',
+  },
+  version: '1.0.0',
+  docker_image: 'ghcr.io/john/gladys-signal-bridge:1.0.0',
+  gladys_version: '>=4.62.0',
+};
+
+// Notification-channel fixture (the Free Mobile family): send only, no
+// inbound path — the per-user identity comes from the contact_schema
+// ("My account" block), never from a code-based link.
+const TEST_NOTIFICATION_MANIFEST = {
+  ...TEST_COMMUNICATION_MANIFEST,
+  name: 'Free Mobile SMS Demo',
+  description: {
+    en: 'Free Mobile SMS notification channel demo.',
+    fr: 'Intégration démo : notifications SMS Free Mobile.',
+  },
+  messaging: { receive: false },
+  contact_schema: [
+    // presentational intro block: skipped by the front view of the profile
+    { key: 'intro', type: 'section', label: { en: 'Free Mobile account' } },
+    { key: 'username', type: 'string', label: { en: 'Free Mobile username', fr: 'Identifiant Free Mobile' } },
+    { key: 'access_token', type: 'secret', label: { en: 'SMS API access token' } },
+  ],
+};
+
+// Weather-provider fixture (B.18): a dedicated provider API — answers the
+// core's weather requests over WebSocket, no device screens.
+const TEST_CALENDAR_MANIFEST = {
+  manifest_version: 1,
+  type: 'calendar',
+  name: 'Nextcloud Calendar',
+  description: {
+    en: 'Nextcloud calendar provider demo integration.',
+    fr: 'Intégration démo : fournisseur de calendrier Nextcloud.',
+  },
+  version: '1.0.0',
+  docker_image: 'ghcr.io/john/gladys-nextcloud-calendar:1.0.0',
+  gladys_version: '>=4.62.0',
+  account_schema: [
+    { key: 'server_url', type: 'string', label: { en: 'Server URL' }, required: true },
+    { key: 'app_password', type: 'secret', label: { en: 'App password' } },
+  ],
+};
+
+const TEST_WEATHER_MANIFEST = {
+  manifest_version: 1,
+  type: 'weather',
+  name: 'Meteo France Demo',
+  description: {
+    en: 'Meteo France weather provider demo integration.',
+    fr: 'Intégration démo : fournisseur météo Météo France.',
+  },
+  version: '1.0.0',
+  docker_image: 'ghcr.io/john/gladys-meteo-france:1.0.0',
+  gladys_version: '>=4.62.0',
+};
+
+// TTS-provider fixture (capabilities/tts-type.md): a text-to-speech engine —
+// Configuration screen only, the core relays synthesize commands over
+// WebSocket and serves the returned audio to speakers.
+const TEST_TTS_MANIFEST = {
+  manifest_version: 1,
+  type: 'tts',
+  name: 'Piper TTS Demo',
+  description: {
+    en: 'Local text-to-speech provider demo.',
+    fr: 'Intégration démo : synthèse vocale locale.',
+  },
+  version: '1.0.0',
+  docker_image: 'ghcr.io/john/gladys-piper-tts:1.0.0',
+  gladys_version: '>=4.62.0',
+  config_schema: [
+    {
+      key: 'voice',
+      type: 'select',
+      label: { en: 'Voice' },
+      default: 'fr_FR-siwis-medium',
+      options: [
+        { value: 'fr_FR-siwis-medium', label: { en: 'Siwis (French)' } },
+        { value: 'en_US-amy-medium', label: { en: 'Amy (English)' } },
+      ],
+    },
+  ],
+};
+
+// Device integration declaring dashboard widgets (capabilities/dashboard-
+// widgets.md): a cinema-like widget with static settings and a vacuum widget
+// bound to one of the integration's devices through `source: "devices"`.
+const TEST_WIDGET_MANIFEST = {
+  ...TEST_MANIFEST,
+  widgets: [
+    {
+      key: 'upcoming_releases',
+      label: { en: 'Upcoming releases', fr: 'Prochaines sorties' },
+      description: { en: 'Movies coming to theaters in your region.' },
+      icon: 'film',
+      settings: [
+        {
+          key: 'period_days',
+          type: 'select',
+          label: { en: 'Period' },
+          default: '30',
+          options: [
+            { value: '15', label: { en: '15 days' } },
+            { value: '30', label: { en: '1 month' } },
+          ],
+        },
+        { key: 'region', type: 'string', label: { en: 'Country code' } },
+      ],
+      action_timeout_seconds: 15,
+    },
+    {
+      key: 'vacuum',
+      label: { en: 'Vacuum' },
+      settings: [{ key: 'device', type: 'select', label: { en: 'Vacuum' }, source: 'devices', required: true }],
+    },
+  ],
+};
+
+// Provider fixture: an integration made only of capabilities (no device
+// surface) — its whole contract is the widget it declares.
+const TEST_PROVIDER_MANIFEST = {
+  manifest_version: 1,
+  type: 'provider',
+  name: 'TMDB Demo',
+  description: {
+    en: 'Upcoming movie releases demo integration.',
+    fr: 'Intégration démo : prochaines sorties cinéma.',
+  },
+  version: '1.0.0',
+  docker_image: 'ghcr.io/john/gladys-tmdb-demo:1.0.0',
+  gladys_version: '>=4.62.0',
+  widgets: [TEST_WIDGET_MANIFEST.widgets[0]],
+};
+
+// Netatmo-like fixture: inbound webhooks relayed by the Gladys Plus
+// gateway — one fire-and-forget event stream (default mode) and one sync
+// challenge/response registration callback.
+// AI-provider fixture (capabilities/ai-type.md): a thin adapter to any AI
+// API (Claude, DeepSeek, OpenAI, a local LLM...) — the core relays
+// OpenAI-compatible chat completion requests over the WebSocket, provider
+// specifics (API key, model) live in the integration's own config_schema.
+const TEST_AI_MANIFEST = {
+  manifest_version: 1,
+  type: 'ai',
+  name: 'Claude Provider Demo',
+  description: {
+    en: 'AI provider demo integration.',
+    fr: 'Intégration démo : fournisseur IA.',
+  },
+  version: '1.0.0',
+  docker_image: 'ghcr.io/john/gladys-claude-provider:1.0.0',
+  gladys_version: '>=4.62.0',
+  config_schema: [{ key: 'api_key', type: 'secret', label: { en: 'API key' } }],
+};
+
+const TEST_WEBHOOKS_MANIFEST = {
+  ...TEST_MANIFEST,
+  webhooks: [
+    { key: 'events', label: { en: 'Netatmo events' } },
+    { key: 'callback', label: { en: 'Subscription callback' }, mode: 'sync' },
+  ],
+};
+
+// Frigate-like fixture: one manual sub-container (Mosquitto pattern: the
+// password file is generated in /data before the first start) and one auto
+// sub-container with volumes, a published port and hardware classes.
+const TEST_CONTAINERS_MANIFEST = {
+  ...TEST_MANIFEST,
+  containers: [
+    {
+      name: 'mqtt',
+      docker_image: 'eclipse-mosquitto:2.0.18',
+      start: 'manual',
+      volumes: ['/mosquitto/config', '/mosquitto/data'],
+      memory_mb: 128,
+    },
+    {
+      name: 'frigate',
+      docker_image: 'ghcr.io/blakeblackshear/frigate:0.14.1',
+      volumes: ['/config'],
+      read_only: false,
+      memory_mb: 1024,
+      shm_mb: 128,
+      cpu: 1,
+      env: { LIBVA_DRIVER_NAME: 'i965' },
+      command: ['python3', '-u', '-m', 'frigate'],
+      ports: [{ container_port: 5000, name: 'frigate_ui', label: { en: 'Frigate UI', fr: 'Interface Frigate' } }],
+      devices: ['coral-usb', 'gpu'],
+    },
+  ],
+};
+
+// Frigate-like fixture declaring one scene trigger (filters on a device and
+// on an enum, an optional free text, three exposed variables — `camera` is
+// deliberately NOT a variable, so the whitelist rule is visible) and one
+// scene action (a device parameter, a templated caption, a boolean, a
+// select, a defaulted number, one scalar output).
+const TEST_SCENE_MANIFEST = {
+  ...TEST_MANIFEST,
+  name: 'Frigate Demo',
+  scene_triggers: [
+    {
+      key: 'object_detected',
+      label: { en: 'Object detected', fr: 'Objet détecté' },
+      description: { en: 'Frigate detected an object on a camera.' },
+      fields: [
+        { key: 'intro', type: 'section', label: { en: 'Zones are the names configured in Frigate' } },
+        { key: 'camera', type: 'select', source: 'devices', label: { en: 'Camera' }, required: true },
+        {
+          key: 'label',
+          type: 'multi_select',
+          label: { en: 'Object types' },
+          options: [
+            { value: 'person', label: { en: 'Person' } },
+            { value: 'car', label: { en: 'Car' } },
+          ],
+        },
+        { key: 'zone', type: 'string', label: { en: 'Zone' } },
+        { key: 'min_score', type: 'number', label: { en: 'Minimal score' } },
+      ],
+      variables: [
+        { key: 'label', type: 'string', label: { en: 'Object type' } },
+        { key: 'zone', type: 'string', label: { en: 'Zone' } },
+        { key: 'score', type: 'number', label: { en: 'Confidence' } },
+        { key: 'moving', type: 'boolean', label: { en: 'Moving' } },
+      ],
+    },
+    { key: 'doorbell_pressed', label: { en: 'Doorbell pressed' } },
+  ],
+  scene_actions: [
+    {
+      key: 'create_snapshot',
+      label: { en: 'Take a snapshot', fr: 'Prendre un instantané' },
+      timeout_seconds: 20,
+      fields: [
+        { key: 'intro', type: 'section', label: { en: 'Snapshot options' } },
+        { key: 'camera', type: 'select', source: 'devices', label: { en: 'Camera' }, required: true },
+        { key: 'caption', type: 'string', label: { en: 'Caption' } },
+        { key: 'hd', type: 'boolean', label: { en: 'HD' } },
+        {
+          key: 'format',
+          type: 'select',
+          label: { en: 'Format' },
+          options: [
+            { value: 'jpg', label: { en: 'JPEG' } },
+            { value: '{{png}}', label: { en: 'Odd value' } },
+          ],
+        },
+        { key: 'quality', type: 'number', label: { en: 'Quality' }, default: 80, min: 1, max: 100 },
+      ],
+      outputs: [
+        { key: 'clip_id', type: 'string', label: { en: 'Clip identifier' } },
+        { key: 'count', type: 'number', label: { en: 'Objects count' } },
+        { key: 'ok', type: 'boolean', label: { en: 'Success' } },
+      ],
+    },
+    { key: 'echo', label: { en: 'Echo' } },
+  ],
+};
+
+const TEST_DETECTED_CLASSES = [
+  { class: 'coral-usb', detected: true, paths: ['/dev/bus/usb'] },
+  { class: 'coral-pcie', detected: false, paths: [] },
+  { class: 'gpu', detected: true, paths: ['/dev/dri'] },
+  { class: 'video', detected: false, paths: [] },
+];
+
+/**
+ * @description Build a fake system manager for supervisor tests.
+ * @param {object} [overrides] - Fakes to override.
+ * @returns {object} The fake system.
+ * @example
+ * const system = buildFakeSystem();
+ */
+function buildFakeSystem(overrides = {}) {
+  return {
+    dockerode: {},
+    gladysVersion: 'v4.82.0',
+    pull: fake.resolves(true),
+    createContainer: fake.resolves({ id: 'container-1' }),
+    removeContainer: fake.resolves(true),
+    stopContainer: fake.resolves(true),
+    restartContainer: fake.resolves(true),
+    // simulates a healthy container holding a CURRENT integration token
+    // (the happy path of verifyContainerToken); tests exercising a stale
+    // token override inspectContainer
+    inspectContainer: fake(async (containerId) => {
+      const serviceInDb = await db.Service.findOne({ where: { container_id: containerId } });
+      const env = serviceInDb
+        ? [
+            `GLADYS_INTEGRATION_TOKEN=${generateIntegrationToken(
+              serviceInDb.id,
+              serviceInDb.token_version,
+              TEST_JWT_SECRET,
+            )}`,
+          ]
+        : [];
+      return { State: { Running: true }, Config: { Env: env } };
+    }),
+    getContainers: fake.resolves([]),
+    getContainerLogs: fake.resolves(Buffer.from('log line')),
+    createNetwork: fake.resolves(true),
+    removeNetwork: fake.resolves(true),
+    getNetworks: fake.resolves([]),
+    connectToNetwork: fake.resolves(true),
+    inspectNetwork: fake.resolves({ IPAM: { Config: [{ Gateway: '172.30.0.1' }] } }),
+    getNetworkMode: fake.resolves('host'),
+    hasCpuCfsSupport: fake.resolves(true),
+    getGladysBasePath: fake.resolves({
+      basePathOnContainer: '/var/lib/gladysassistant',
+      basePathOnHost: '/var/lib/gladysassistant',
+    }),
+    getGladysContainerId: fake.resolves('gladys-container-id'),
+    getImageLabels: fake.resolves({}),
+    // every image is present on the machine by default (the state after an
+    // install): a test of the missing-image paths (restore case, local
+    // fallback of ensureImage) opts out explicitly
+    imageExists: fake.resolves(true),
+    listImages: fake.resolves([]),
+    getImagePullTime: fake.returns(undefined),
+    removeImage: fake.resolves(true),
+    detectHardwareClasses: fake.resolves(TEST_DETECTED_CLASSES),
+    ...overrides,
+  };
+}
+
+// energy contracts capability: a rules template with inputs, a delegated one, a calendar
+const TEST_ENERGY_MANIFEST = {
+  ...TEST_MANIFEST,
+  name: 'Octopus Energy Demo',
+  energy_contracts: {
+    templates: [
+      {
+        key: 'economy-7',
+        name: { en: 'Economy 7', fr: 'Economy 7' },
+        country: 'GB',
+        currency: 'GBP',
+        timezone: 'Etc/GMT',
+        pricing_mode: 'rules',
+        version: '2026-01-01',
+        calendars: ['agile-gb'],
+        inputs: [
+          { key: 'night_price', type: 'number', unit: 'GBP/kWh', default: 0.12, label: { en: 'Night price' } },
+          { key: 'region', type: 'select', options: ['A', 'B'], default: 'A' },
+          { key: 'off_peak_slots', type: 'time_intervals', default: [['00:30', '07:30']] },
+          { key: 'note', type: 'string' },
+        ],
+        tariff: {
+          tariff_version: 1,
+          calendars: ['agile-gb'],
+          components: [
+            {
+              key: 'energy',
+              kind: 'consumption',
+              rules: [
+                { label: 'night', when: { time: '{{input:off_peak_slots}}' }, price: '{{input:night_price}}' },
+                { when: { calendar: { 'agile-gb': 'cap' } }, price: 0.3 },
+              ],
+              fallback: { price: 0.28 },
+            },
+          ],
+        },
+      },
+      {
+        key: 'agile',
+        name: { en: 'Octopus Agile' },
+        country: 'GB',
+        currency: 'GBP',
+        pricing_mode: 'delegated',
+        version: '1',
+        inputs: [{ key: 'region', type: 'select', options: ['A', 'B'] }],
+        tariff: {
+          tariff_version: 1,
+          components: [{ key: 'standing', kind: 'fixed', amount: 0.5, per: 'day' }],
+        },
+      },
+    ],
+    calendars: [{ key: 'agile-gb', granularity: 'day', values: ['cap', 'normal'], timezone: 'Europe/London' }],
+  },
+};
+
+/**
+ * @description Build a supervisor wired with fakes for tests.
+ * @param {object} [options] - Options.
+ * @param {object} [options.system] - System fakes overrides.
+ * @returns {object} { externalIntegration, event, system, stateManager, device, variable, energyPrice }.
+ * @example
+ * const { externalIntegration } = buildSupervisor();
+ */
+function buildSupervisor({ system: systemOverrides } = {}) {
+  const event = { emit: fake.returns(null), on: fake.returns(null) };
+  const system = buildFakeSystem(systemOverrides);
+  const stateManager = new StateManager(event);
+  const device = { destroy: fake.resolves(null) };
+  const variable = new Variable(event);
+  const serviceManager = {};
+  const cache = new Cache();
+  const calendar = new Calendar();
+  // no energy contract configured by default: a discovered energy index then gets
+  // its derived features with no parent meter (see getDiscoveredDevices); the
+  // calendar and contract functions are fakes the capability tests override
+  const energyContract = {
+    getDefaultElectricMeterFeatureId: fake.resolves(null),
+    declareCalendar: fake.resolves({ accepted: true, calendar: {} }),
+    publishCalendarEntries: fake.resolves({ count: 0, changed_from: null }),
+    getCalendarEntries: fake.resolves([]),
+    get: fake.resolves([]),
+    requestCalendarRecalculation: fake.resolves(null),
+  };
+  const externalIntegration = new ExternalIntegration(
+    event,
+    system,
+    serviceManager,
+    stateManager,
+    device,
+    variable,
+    energyContract,
+    TEST_JWT_SECRET,
+    cache,
+    calendar,
+  );
+  externalIntegration.available = true;
+  return {
+    externalIntegration,
+    event,
+    system,
+    stateManager,
+    device,
+    variable,
+    cache,
+    energyContract,
+    // kept under its former name for the tests written against it
+    energyPrice: energyContract,
+    calendar,
+  };
+}
+
+/**
+ * @description Seed one external integration service in DB.
+ * @param {object} [overrides] - Columns to override.
+ * @returns {Promise<object>} The created service (plain).
+ * @example
+ * const service = await seedExternalService();
+ */
+async function seedExternalService(overrides = {}) {
+  const createdService = await db.Service.create({
+    name: 'ext-dev-open-meteo-demo',
+    selector: 'ext-dev-open-meteo-demo',
+    version: '1.2.0',
+    has_message_feature: false,
+    status: SERVICE_STATUS.RUNNING,
+    type: SERVICE_TYPES.EXTERNAL,
+    docker_image: TEST_MANIFEST.docker_image,
+    manifest: TEST_MANIFEST,
+    container_id: 'container-1',
+    token_version: 1,
+    ...overrides,
+  });
+  return createdService.get({ plain: true });
+}
+
+module.exports = {
+  TEST_JWT_SECRET,
+  TEST_MANIFEST,
+  TEST_COMMUNICATION_MANIFEST,
+  TEST_NOTIFICATION_MANIFEST,
+  TEST_WEATHER_MANIFEST,
+  TEST_AI_MANIFEST,
+  TEST_TTS_MANIFEST,
+  TEST_CALENDAR_MANIFEST,
+  TEST_WIDGET_MANIFEST,
+  TEST_PROVIDER_MANIFEST,
+  TEST_WEBHOOKS_MANIFEST,
+  TEST_CONTAINERS_MANIFEST,
+  TEST_SCENE_MANIFEST,
+  TEST_ENERGY_MANIFEST,
+  TEST_DETECTED_CLASSES,
+  buildFakeSystem,
+  buildSupervisor,
+  seedExternalService,
+};

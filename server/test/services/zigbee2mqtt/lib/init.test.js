@@ -1,0 +1,330 @@
+const sinon = require('sinon').createSandbox();
+const { expect } = require('chai');
+
+const { assert, fake } = sinon;
+
+const Zigbee2mqttManager = require('../../../../services/zigbee2mqtt/lib');
+
+const container = {
+  id: 'docker-test',
+};
+
+const serviceId = 'f87b7af2-ca8e-44fc-b754-444354b42fee';
+
+describe('zigbee2mqtt init', () => {
+  // PREPARE
+  let zigbee2mqttManager;
+  let gladys;
+  let clock;
+
+  beforeEach(() => {
+    gladys = {
+      job: {
+        wrapper: (type, func) => {
+          return async () => {
+            return func();
+          };
+        },
+      },
+      system: {
+        getContainers: fake.resolves([container]),
+        stopContainer: fake.resolves(true),
+        isDocker: fake.resolves(true),
+        getNetworkMode: fake.resolves('host'),
+        restartContainer: fake.resolves(true),
+      },
+      service: {
+        getService: fake.returns({
+          list: fake.resolves([
+            {
+              path: '/dev/ttyUSB0',
+            },
+          ]),
+        }),
+      },
+    };
+
+    zigbee2mqttManager = new Zigbee2mqttManager(gladys, {}, serviceId);
+
+    zigbee2mqttManager.getConfiguration = sinon.stub();
+    zigbee2mqttManager.saveConfiguration = sinon.stub();
+    zigbee2mqttManager.checkForContainerUpdates = sinon.stub();
+    zigbee2mqttManager.installMqttContainer = sinon.stub();
+    zigbee2mqttManager.installZ2mContainer = sinon.stub();
+    zigbee2mqttManager.emitStatusEvent = sinon.stub();
+    zigbee2mqttManager.isEnabled = sinon.stub();
+    zigbee2mqttManager.connect = sinon.stub();
+
+    zigbee2mqttManager.dockerBased = undefined;
+    zigbee2mqttManager.networkModeValid = undefined;
+    zigbee2mqttManager.usbConfigured = undefined;
+
+    clock = sinon.useFakeTimers();
+  });
+
+  afterEach(() => {
+    clock.restore();
+    sinon.reset();
+  });
+
+  it('should fail because not a Docker System', async () => {
+    // PREPARE
+    gladys.system.isDocker = fake.resolves(false);
+    zigbee2mqttManager.getConfiguration = fake.resolves({
+      mqttMode: 'local',
+    });
+    // EXECUTE
+    try {
+      await zigbee2mqttManager.init();
+      assert.fail();
+    } catch (e) {
+      expect(e.message).to.equal('SYSTEM_NOT_RUNNING_DOCKER');
+    }
+    // ASSERT
+    expect(zigbee2mqttManager.dockerBased).to.equal(false);
+    assert.calledOnce(zigbee2mqttManager.getConfiguration);
+    assert.notCalled(zigbee2mqttManager.saveConfiguration);
+    assert.notCalled(zigbee2mqttManager.checkForContainerUpdates);
+    assert.notCalled(zigbee2mqttManager.installMqttContainer);
+    assert.notCalled(zigbee2mqttManager.installZ2mContainer);
+    assert.notCalled(zigbee2mqttManager.isEnabled);
+    assert.notCalled(zigbee2mqttManager.connect);
+    assert.notCalled(zigbee2mqttManager.emitStatusEvent);
+  });
+
+  it('should end a pending startup and stop asking Zigbee2mqtt whether it runs', async () => {
+    // PREPARE
+    const startingTimeout = fake();
+    const healthCheckRetry = fake();
+    zigbee2mqttManager.zigbee2mqttStarting = true;
+    zigbee2mqttManager.startingTimer = setTimeout(startingTimeout, 1000);
+    zigbee2mqttManager.healthCheckTimer = setTimeout(healthCheckRetry, 1000);
+    gladys.system.isDocker = fake.resolves(false);
+    zigbee2mqttManager.getConfiguration = fake.resolves({ mqttMode: 'local' });
+    // EXECUTE
+    await zigbee2mqttManager.init().catch(() => {});
+    clock.tick(1000);
+    // ASSERT
+    assert.notCalled(startingTimeout);
+    assert.notCalled(healthCheckRetry);
+    expect(zigbee2mqttManager.startingTimer).to.equal(null);
+    expect(zigbee2mqttManager.healthCheckTimer).to.equal(null);
+    expect(zigbee2mqttManager.zigbee2mqttStarting).to.equal(false);
+  });
+
+  it('should init system in remote mode', async () => {
+    // PREPARE
+    gladys.system.isDocker = fake.resolves(false);
+    zigbee2mqttManager.getConfiguration = fake.resolves({
+      mqttMode: 'external',
+    });
+    // EXECUTE
+    await zigbee2mqttManager.init();
+    // ASSERT
+    expect(zigbee2mqttManager.dockerBased).to.equal(false);
+    assert.calledOnce(zigbee2mqttManager.getConfiguration);
+    assert.calledOnce(zigbee2mqttManager.saveConfiguration);
+    assert.notCalled(zigbee2mqttManager.checkForContainerUpdates);
+    assert.notCalled(zigbee2mqttManager.installMqttContainer);
+    assert.notCalled(zigbee2mqttManager.installZ2mContainer);
+    assert.notCalled(zigbee2mqttManager.isEnabled);
+    assert.calledOnce(zigbee2mqttManager.connect);
+    assert.called(zigbee2mqttManager.emitStatusEvent);
+  });
+
+  it('should fail because not a host network', async () => {
+    // PREPARE
+    gladys.system.getNetworkMode = fake.resolves('container');
+    zigbee2mqttManager.getConfiguration = fake.resolves({
+      mqttMode: 'local',
+    });
+    // EXECUTE
+    try {
+      await zigbee2mqttManager.init();
+      assert.fail();
+    } catch (e) {
+      expect(e.message).to.equal('DOCKER_BAD_NETWORK');
+    }
+    // ASSERT
+    expect(zigbee2mqttManager.networkModeValid).to.equal(false);
+    assert.calledOnce(zigbee2mqttManager.getConfiguration);
+    assert.notCalled(zigbee2mqttManager.saveConfiguration);
+    assert.notCalled(zigbee2mqttManager.checkForContainerUpdates);
+    assert.notCalled(zigbee2mqttManager.installMqttContainer);
+    assert.notCalled(zigbee2mqttManager.installZ2mContainer);
+    assert.notCalled(zigbee2mqttManager.isEnabled);
+    assert.notCalled(zigbee2mqttManager.connect);
+    assert.calledOnceWithExactly(zigbee2mqttManager.emitStatusEvent);
+  });
+
+  it('should not install containers, usb is not configured', async () => {
+    // PREPARE
+    const config = { mqttPassword: 'mqttPassword' };
+    zigbee2mqttManager.getConfiguration.resolves({ ...config });
+
+    // EXECUTE
+    await zigbee2mqttManager.init();
+    // ASSERT
+    assert.calledOnceWithExactly(zigbee2mqttManager.getConfiguration);
+    assert.calledOnce(zigbee2mqttManager.saveConfiguration);
+    assert.notCalled(zigbee2mqttManager.checkForContainerUpdates);
+    assert.notCalled(zigbee2mqttManager.installMqttContainer);
+    assert.notCalled(zigbee2mqttManager.installZ2mContainer);
+    assert.notCalled(zigbee2mqttManager.isEnabled);
+    assert.notCalled(zigbee2mqttManager.connect);
+    assert.calledThrice(zigbee2mqttManager.emitStatusEvent);
+  });
+
+  it('should not install containers, usb port not found', async () => {
+    // PREPARE
+    const config = { z2mDriverPath: 'unknown/path', mqttPassword: 'mqttPassword' };
+    zigbee2mqttManager.getConfiguration.resolves({ ...config });
+
+    // EXECUTE
+    await zigbee2mqttManager.init();
+    // ASSERT
+    assert.calledOnceWithExactly(zigbee2mqttManager.getConfiguration);
+    assert.calledOnce(zigbee2mqttManager.saveConfiguration);
+    assert.notCalled(zigbee2mqttManager.checkForContainerUpdates);
+    assert.notCalled(zigbee2mqttManager.installMqttContainer);
+    assert.notCalled(zigbee2mqttManager.installZ2mContainer);
+    assert.notCalled(zigbee2mqttManager.isEnabled);
+    assert.notCalled(zigbee2mqttManager.connect);
+    assert.calledThrice(zigbee2mqttManager.emitStatusEvent);
+  });
+
+  it('should install containers, usb port is found', async () => {
+    // PREPARE
+    const config = { z2mDriverPath: '/dev/ttyUSB0', mqttPassword: 'mqttPassword' };
+    zigbee2mqttManager.getConfiguration.resolves({ ...config });
+
+    // EXECUTE
+    await zigbee2mqttManager.init();
+    // ASSERT
+    assert.calledOnce(zigbee2mqttManager.getConfiguration);
+    assert.calledOnce(zigbee2mqttManager.saveConfiguration);
+    assert.calledOnce(zigbee2mqttManager.checkForContainerUpdates);
+    assert.calledOnce(zigbee2mqttManager.installMqttContainer);
+    assert.calledOnce(zigbee2mqttManager.installZ2mContainer);
+    assert.notCalled(zigbee2mqttManager.isEnabled);
+    assert.notCalled(zigbee2mqttManager.connect);
+    assert.calledThrice(zigbee2mqttManager.emitStatusEvent);
+  });
+
+  it('should not install containers, network coordinator not configured', async () => {
+    // PREPARE
+    const config = { z2mAdapterMode: 'network', mqttPassword: 'mqttPassword' };
+    zigbee2mqttManager.getConfiguration.resolves({ ...config });
+
+    // EXECUTE
+    await zigbee2mqttManager.init();
+    // ASSERT
+    expect(zigbee2mqttManager.networkAdapterConfigured).to.equal(false);
+    assert.notCalled(zigbee2mqttManager.checkForContainerUpdates);
+    assert.notCalled(zigbee2mqttManager.installMqttContainer);
+    assert.notCalled(zigbee2mqttManager.installZ2mContainer);
+    assert.notCalled(zigbee2mqttManager.connect);
+  });
+
+  it('should install containers, network coordinator is configured', async () => {
+    // PREPARE
+    const config = {
+      z2mAdapterMode: 'network',
+      z2mNetworkAdapterUrl: 'tcp://192.168.1.20:6638',
+      mqttPassword: 'mqttPassword',
+    };
+    zigbee2mqttManager.getConfiguration.resolves({ ...config });
+
+    // EXECUTE
+    await zigbee2mqttManager.init();
+    // ASSERT
+    expect(zigbee2mqttManager.networkAdapterConfigured).to.equal(true);
+    expect(zigbee2mqttManager.usbConfigured).to.equal(false);
+    // The USB service is not requested in network mode
+    assert.notCalled(gladys.service.getService);
+    assert.calledOnce(zigbee2mqttManager.checkForContainerUpdates);
+    assert.calledOnce(zigbee2mqttManager.installMqttContainer);
+    assert.calledOnce(zigbee2mqttManager.installZ2mContainer);
+    assert.notCalled(zigbee2mqttManager.isEnabled);
+  });
+
+  it('should save default mqtt params', async () => {
+    // PREPARE
+    const config = { mqttMode: 'local', z2mDriverPath: '/dev/ttyUSB0' };
+    zigbee2mqttManager.getConfiguration.resolves({ ...config });
+
+    // EXECUTE
+    await zigbee2mqttManager.init();
+    // ASSERT
+    const expectedNewConfig = {
+      mqttUrl: 'mqtt://localhost:1884',
+      z2mMqttUsername: 'z2m',
+      mqttUsername: 'gladys',
+      z2mDriverPath: '/dev/ttyUSB0',
+    };
+
+    assert.calledOnceWithExactly(zigbee2mqttManager.getConfiguration);
+    assert.calledOnce(zigbee2mqttManager.saveConfiguration);
+    assert.calledWithMatch(zigbee2mqttManager.saveConfiguration, sinon.match(expectedNewConfig));
+    assert.calledOnce(zigbee2mqttManager.checkForContainerUpdates);
+    assert.calledWithMatch(zigbee2mqttManager.checkForContainerUpdates, sinon.match(expectedNewConfig));
+    assert.calledOnce(zigbee2mqttManager.installMqttContainer);
+    assert.calledWithMatch(zigbee2mqttManager.installMqttContainer, sinon.match(expectedNewConfig));
+    assert.calledOnce(zigbee2mqttManager.installZ2mContainer);
+    assert.calledWithMatch(zigbee2mqttManager.installZ2mContainer, sinon.match(expectedNewConfig));
+    assert.notCalled(zigbee2mqttManager.isEnabled);
+    assert.notCalled(zigbee2mqttManager.connect);
+    assert.calledThrice(zigbee2mqttManager.emitStatusEvent);
+  });
+
+  it('should connect', async () => {
+    // PREPARE
+    const config = { z2mDriverPath: '/dev/ttyUSB0', mqttPassword: 'mqttPassword' };
+    zigbee2mqttManager.getConfiguration.resolves({ ...config });
+    // The broker runs, Zigbee2mqtt is not online yet: Gladys must connect to the broker to hear it
+    zigbee2mqttManager.installMqttContainer.callsFake(() => {
+      zigbee2mqttManager.mqttRunning = true;
+    });
+    zigbee2mqttManager.isEnabled.returns(false);
+
+    gladys.scheduler = {
+      scheduleJob: fake.returns(true),
+    };
+
+    // EXECUTE
+    await zigbee2mqttManager.init();
+    // ASSERT
+    assert.calledOnceWithExactly(zigbee2mqttManager.getConfiguration);
+    assert.calledOnce(zigbee2mqttManager.saveConfiguration);
+    assert.calledOnce(zigbee2mqttManager.installMqttContainer);
+    assert.calledOnce(zigbee2mqttManager.installZ2mContainer);
+    assert.notCalled(zigbee2mqttManager.isEnabled);
+    assert.calledOnce(zigbee2mqttManager.connect);
+    assert.calledOnce(gladys.scheduler.scheduleJob);
+    assert.calledThrice(zigbee2mqttManager.emitStatusEvent);
+  });
+
+  it('should connect and scheduler already there', async () => {
+    // PREPARE
+    const config = { z2mDriverPath: '/dev/ttyUSB0', mqttPassword: 'mqttPassword' };
+    zigbee2mqttManager.getConfiguration.resolves({ ...config });
+    // The broker runs, Zigbee2mqtt is not online yet: Gladys must connect to the broker to hear it
+    zigbee2mqttManager.installMqttContainer.callsFake(() => {
+      zigbee2mqttManager.mqttRunning = true;
+    });
+    zigbee2mqttManager.isEnabled.returns(false);
+    zigbee2mqttManager.backupScheduledJob = 'this is not null';
+
+    // EXECUTE
+    await zigbee2mqttManager.init();
+    // ASSERT
+    assert.calledOnceWithExactly(zigbee2mqttManager.getConfiguration);
+    assert.calledOnce(zigbee2mqttManager.saveConfiguration);
+    assert.calledOnce(zigbee2mqttManager.checkForContainerUpdates);
+    assert.calledOnce(zigbee2mqttManager.installMqttContainer);
+    assert.calledOnce(zigbee2mqttManager.installZ2mContainer);
+    assert.notCalled(zigbee2mqttManager.isEnabled);
+    assert.calledOnce(zigbee2mqttManager.connect);
+    assert.calledThrice(zigbee2mqttManager.emitStatusEvent);
+  });
+});

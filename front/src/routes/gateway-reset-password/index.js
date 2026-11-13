@@ -1,0 +1,155 @@
+import { Component } from 'preact';
+import { connect } from 'unistore/preact';
+import linkState from 'linkstate';
+import get from 'get-value';
+import ResetPassword from './ResetPassword';
+import { RequestStatus } from '../../utils/consts';
+
+class ResetPasswordPage extends Component {
+  state = {
+    password: '',
+    passwordRepeat: '',
+    twoFactorEnabled: null,
+    useRecoveryCode: false,
+    success: false,
+    resetInProgress: false,
+    twoFactorResetStatus: null,
+    twoFactorResetError: null
+  };
+
+  // The user forgot their password AND lost their two-factor app and recovery codes,
+  // with no Gladys connected to Gladys Plus: the reset password link proves the mailbox,
+  // Gladys Plus emails a link that resets their two-factor authentication.
+  requestTwoFactorReset = async e => {
+    e.preventDefault();
+    if (
+      this.state.twoFactorResetStatus === RequestStatus.Getting ||
+      this.state.twoFactorResetStatus === RequestStatus.Success
+    ) {
+      return;
+    }
+    this.setState({ twoFactorResetStatus: RequestStatus.Getting, twoFactorResetError: null });
+    try {
+      await this.props.session.gatewayClient.requestTwoFactorResetFromPasswordReset(this.props.token);
+      this.setState({ twoFactorResetStatus: RequestStatus.Success });
+    } catch (e) {
+      const status = get(e, 'response.status');
+      // the request carries the reset password token: never the whole error in the console
+      console.error('Could not request the two factor reset', status || e.message);
+      const errorMessage = get(e, 'response.data.error_message');
+      let error = 'UNKNOWN';
+      if (errorMessage === 'INSTANCE_CONNECTED') {
+        error = 'INSTANCE_CONNECTED';
+      } else if (status === 429) {
+        error = 'TOO_MANY';
+      } else if (status === 404) {
+        error = 'LINK';
+      }
+      this.setState({ twoFactorResetStatus: RequestStatus.Error, twoFactorResetError: error });
+    }
+  };
+
+  showRecoveryCode = e => {
+    e.preventDefault();
+    this.setState({ useRecoveryCode: true, invalidRecoveryCode: false });
+  };
+
+  showTwoFactorCode = e => {
+    e.preventDefault();
+    this.setState({ useRecoveryCode: false, invalidRecoveryCode: false });
+  };
+
+  resetPassword = async e => {
+    e.preventDefault();
+
+    if (this.state.password !== this.state.passwordRepeat) {
+      return this.setState({ passwordNotMatching: true });
+    }
+
+    if (this.state.password.length < 8) {
+      return this.setState({ passwordError: true, passwordNotMatching: false });
+    }
+
+    this.setState({
+      passwordError: false,
+      passwordNotMatching: false,
+      errorLink: false,
+      invalidRecoveryCode: false,
+      resetInProgress: true
+    });
+
+    try {
+      let user = await this.props.session.gatewayClient.getResetPasswordEmail(this.props.token);
+      if (user.two_factor_enabled === true && this.state.twoFactorEnabled === null) {
+        this.setState({ twoFactorEnabled: true, resetInProgress: false });
+      } else {
+        await this.props.session.gatewayClient.resetPassword(
+          user.email,
+          this.state.password,
+          this.props.token,
+          this.state.useRecoveryCode ? undefined : this.state.twoFactorCode,
+          this.state.useRecoveryCode ? this.state.twoFactorRecoveryCode : undefined
+        );
+        this.setState({ success: true, resetInProgress: false });
+      }
+    } catch (e) {
+      // A wrong or already used recovery code is rejected by the gateway with a 4xx:
+      // it doesn't mean the reset link itself is dead.
+      const status = get(e, 'response.status');
+      if (this.state.useRecoveryCode && status >= 400 && status < 500) {
+        this.setState({ invalidRecoveryCode: true, resetInProgress: false });
+      } else {
+        this.setState({ errorLink: true, resetInProgress: false });
+      }
+    }
+  };
+
+  render(
+    {},
+    {
+      password,
+      success,
+      errorLink,
+      invalidRecoveryCode,
+      twoFactorEnabled,
+      passwordRepeat,
+      twoFactorCode,
+      useRecoveryCode,
+      twoFactorRecoveryCode,
+      passwordError,
+      passwordNotMatching,
+      resetInProgress,
+      twoFactorResetStatus,
+      twoFactorResetError
+    }
+  ) {
+    return (
+      <ResetPassword
+        password={password}
+        updatePassword={linkState(this, 'password')}
+        resetPassword={this.resetPassword}
+        success={success}
+        errorLink={errorLink}
+        invalidRecoveryCode={invalidRecoveryCode}
+        passwordError={passwordError}
+        passwordNotMatching={passwordNotMatching}
+        twoFactorEnabled={twoFactorEnabled}
+        twoFactorCode={twoFactorCode}
+        updateTwoFactorCode={linkState(this, 'twoFactorCode')}
+        useRecoveryCode={useRecoveryCode}
+        twoFactorRecoveryCode={twoFactorRecoveryCode}
+        updateTwoFactorRecoveryCode={linkState(this, 'twoFactorRecoveryCode')}
+        showRecoveryCode={this.showRecoveryCode}
+        showTwoFactorCode={this.showTwoFactorCode}
+        passwordRepeat={passwordRepeat}
+        updatePasswordRepeat={linkState(this, 'passwordRepeat')}
+        resetInProgress={resetInProgress}
+        requestTwoFactorReset={this.requestTwoFactorReset}
+        twoFactorResetStatus={twoFactorResetStatus}
+        twoFactorResetError={twoFactorResetError}
+      />
+    );
+  }
+}
+
+export default connect('session', {})(ResetPasswordPage);

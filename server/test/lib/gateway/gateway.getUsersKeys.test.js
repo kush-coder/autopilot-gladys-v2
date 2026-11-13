@@ -1,0 +1,223 @@
+const { expect } = require('chai');
+const sinon = require('sinon').createSandbox();
+const proxyquire = require('proxyquire').noCallThru();
+
+const GladysGatewayClientMock = require('./GladysGatewayClientMock.test');
+const { SYSTEM_VARIABLE_NAMES } = require('../../../utils/constants');
+
+const { fake, assert } = sinon;
+const Gateway = proxyquire('../../../lib/gateway', {
+  '@gladysassistant/gladys-gateway-js': GladysGatewayClientMock,
+});
+
+describe('gateway.getUsersKeys', () => {
+  const variable = {};
+
+  let gateway;
+
+  beforeEach(async () => {
+    const job = {
+      wrapper: (type, func) => {
+        return async () => {
+          return func();
+        };
+      },
+      updateProgress: fake.resolves({}),
+    };
+
+    variable.getValue = fake.resolves('[]');
+    variable.setValue = fake.resolves(null);
+
+    const scheduler = {
+      scheduleJob: (rule, callback) => {
+        return {
+          callback,
+          rule,
+          cancel: () => {},
+        };
+      },
+    };
+
+    const event = {
+      on: fake.returns(null),
+      emit: fake.returns(null),
+    };
+
+    gateway = new Gateway(variable, event, {}, {}, {}, {}, {}, {}, job, scheduler);
+  });
+
+  afterEach(() => {
+    sinon.reset();
+  });
+
+  it('should get users keys with no users in current list', async () => {
+    const users = await gateway.getUsersKeys();
+    expect(users).to.deep.equal([
+      {
+        id: '55b440f0-99fc-4ef8-bfe6-cd13adb4071e',
+        name: 'Tony',
+        rsa_public_key: 'fingerprint',
+        ecdsa_public_key: 'fingerprint',
+        gladys_4_user_id: 'df033006-ee42-4b94-a324-3f558171c493',
+        connected: false,
+        accepted: false,
+      },
+    ]);
+    assert.calledOnceWithExactly(
+      variable.setValue,
+      SYSTEM_VARIABLE_NAMES.GLADYS_GATEWAY_USERS_KEYS,
+      JSON.stringify(users),
+    );
+  });
+  it('should merge new user keys with old user', async () => {
+    const oldUsers = [
+      {
+        id: '55b440f0-99fc-4ef8-bfe6-cd13adb4071e',
+        name: 'Tony',
+        rsa_public_key: 'fingerprint',
+        ecdsa_public_key: 'not-the-fingerprint',
+        gladys_4_user_id: 'df033006-ee42-4b94-a324-3f558171c493',
+        connected: false,
+        accepted: true,
+      },
+    ];
+    variable.getValue = fake.resolves(JSON.stringify(oldUsers));
+
+    const users = await gateway.getUsersKeys();
+    expect(users).to.deep.equal([
+      {
+        id: '55b440f0-99fc-4ef8-bfe6-cd13adb4071e',
+        name: 'Tony',
+        rsa_public_key: 'fingerprint',
+        ecdsa_public_key: 'fingerprint',
+        gladys_4_user_id: 'df033006-ee42-4b94-a324-3f558171c493',
+        connected: false,
+        accepted: false,
+        keys_changed: true,
+      },
+    ]);
+  });
+  it('should merge new user keys with old user', async () => {
+    const oldUsers = [
+      {
+        id: '55b440f0-99fc-4ef8-bfe6-cd13adb4071e',
+        name: 'Tony',
+        rsa_public_key: 'not-the-fingerprint',
+        ecdsa_public_key: 'not-the-fingerprint',
+        gladys_4_user_id: 'df033006-ee42-4b94-a324-3f558171c493',
+        connected: false,
+        accepted: true,
+      },
+    ];
+    variable.getValue = fake.resolves(JSON.stringify(oldUsers));
+
+    const users = await gateway.getUsersKeys();
+    expect(users).to.deep.equal([
+      {
+        id: '55b440f0-99fc-4ef8-bfe6-cd13adb4071e',
+        name: 'Tony',
+        rsa_public_key: 'fingerprint',
+        ecdsa_public_key: 'fingerprint',
+        gladys_4_user_id: 'df033006-ee42-4b94-a324-3f558171c493',
+        connected: false,
+        accepted: false,
+        keys_changed: true,
+      },
+    ]);
+  });
+  it('should refresh the name, the linked Gladys user and the connection state of a known user', async () => {
+    const oldUsers = [
+      {
+        id: '55b440f0-99fc-4ef8-bfe6-cd13adb4071e',
+        name: 'Old name',
+        rsa_public_key: 'fingerprint',
+        ecdsa_public_key: 'fingerprint',
+        gladys_4_user_id: null,
+        connected: true,
+        accepted: true,
+      },
+    ];
+    variable.getValue = fake.resolves(JSON.stringify(oldUsers));
+
+    const users = await gateway.getUsersKeys();
+    expect(users).to.deep.equal([
+      {
+        id: '55b440f0-99fc-4ef8-bfe6-cd13adb4071e',
+        name: 'Tony',
+        rsa_public_key: 'fingerprint',
+        ecdsa_public_key: 'fingerprint',
+        gladys_4_user_id: 'df033006-ee42-4b94-a324-3f558171c493',
+        connected: false,
+        accepted: true,
+      },
+    ]);
+  });
+  it('should not flag the keys as changed for a user who was never accepted', async () => {
+    const oldUsers = [
+      {
+        id: '55b440f0-99fc-4ef8-bfe6-cd13adb4071e',
+        name: 'Tony',
+        rsa_public_key: 'not-the-fingerprint',
+        ecdsa_public_key: 'not-the-fingerprint',
+        gladys_4_user_id: 'df033006-ee42-4b94-a324-3f558171c493',
+        connected: false,
+        accepted: false,
+      },
+    ];
+    variable.getValue = fake.resolves(JSON.stringify(oldUsers));
+
+    const users = await gateway.getUsersKeys();
+    expect(users).to.have.lengthOf(1);
+    expect(users[0]).to.include({ rsa_public_key: 'fingerprint', accepted: false, keys_changed: false });
+  });
+  it('should keep the keys flagged as changed when they change again before being accepted', async () => {
+    const oldUsers = [
+      {
+        id: '55b440f0-99fc-4ef8-bfe6-cd13adb4071e',
+        name: 'Tony',
+        rsa_public_key: 'not-the-fingerprint',
+        ecdsa_public_key: 'not-the-fingerprint',
+        gladys_4_user_id: 'df033006-ee42-4b94-a324-3f558171c493',
+        connected: false,
+        accepted: false,
+        keys_changed: true,
+      },
+    ];
+    variable.getValue = fake.resolves(JSON.stringify(oldUsers));
+
+    const users = await gateway.getUsersKeys();
+    expect(users).to.have.lengthOf(1);
+    expect(users[0]).to.include({ rsa_public_key: 'fingerprint', accepted: false, keys_changed: true });
+  });
+  it('should remove users deleted from Gladys Plus', async () => {
+    const oldUsers = [
+      {
+        id: '55b440f0-99fc-4ef8-bfe6-cd13adb4071e',
+        name: 'Tony',
+        rsa_public_key: 'fingerprint',
+        ecdsa_public_key: 'fingerprint',
+        gladys_4_user_id: 'df033006-ee42-4b94-a324-3f558171c493',
+        connected: false,
+        accepted: false,
+      },
+      {
+        id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+        name: 'Removed user',
+        rsa_public_key: 'old-fingerprint',
+        ecdsa_public_key: 'old-fingerprint',
+        gladys_4_user_id: '11111111-2222-3333-4444-555555555555',
+        connected: false,
+        accepted: true,
+      },
+    ];
+    variable.getValue = fake.resolves(JSON.stringify(oldUsers));
+
+    const users = await gateway.getUsersKeys();
+    expect(users).to.deep.equal([oldUsers[0]]);
+    assert.calledOnceWithExactly(
+      variable.setValue,
+      SYSTEM_VARIABLE_NAMES.GLADYS_GATEWAY_USERS_KEYS,
+      JSON.stringify([oldUsers[0]]),
+    );
+  });
+});

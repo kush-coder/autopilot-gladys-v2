@@ -1,0 +1,58 @@
+const { loadSchemas } = require('./loadSchemas');
+const { createServer } = require('./createServer');
+const { stopServer } = require('./stopServer');
+const { getAllResources, getAllTools } = require('./buildSchemas');
+const { formatValue } = require('./formatValue');
+const { proxy } = require('./mcp.proxy');
+const {
+  isSensorFeature,
+  isSwitchableFeature,
+  isLightControlFeature,
+  isShutterFeature,
+  isHistoryFeature,
+  isBatteryFeature,
+  isWritableSensorFeature,
+} = require('./selectFeature');
+const { findBySimilarity } = require('./findBySimilarity');
+const { eventFunctionWrapper } = require('../../../utils/functionsWrapper');
+
+/**
+ * @description Add ability to connect to MCP.
+ * @param {object} gladys - Gladys instance.
+ * @param {string} serviceId - UUID of the service in DB.
+ * @param {object} mcp - MCP library.
+ * @param {object} toon - Toon encoding library.
+ * @param {object} levenshtein - Levenshtein library.
+ * @example
+ * const mcpHandler = new MCPHandler(gladys, serviceId, mcp);
+ */
+const MCPHandler = function MCPHandler(gladys, serviceId, mcp, toon, levenshtein) {
+  this.gladys = gladys;
+  this.serviceId = serviceId;
+  this.mcp = mcp;
+  this.toon = toon;
+  this.levenshtein = levenshtein;
+  this.schemas = null;
+  this.listening = false;
+  this.transports = {};
+
+  this.reloadCb = eventFunctionWrapper(this.loadSchemas.bind(this));
+};
+
+MCPHandler.prototype.loadSchemas = loadSchemas;
+MCPHandler.prototype.createServer = createServer;
+MCPHandler.prototype.stopServer = stopServer;
+MCPHandler.prototype.getAllResources = getAllResources;
+MCPHandler.prototype.getAllTools = getAllTools;
+MCPHandler.prototype.isSensorFeature = isSensorFeature;
+MCPHandler.prototype.isSwitchableFeature = isSwitchableFeature;
+MCPHandler.prototype.isLightControlFeature = isLightControlFeature;
+MCPHandler.prototype.isShutterFeature = isShutterFeature;
+MCPHandler.prototype.isHistoryFeature = isHistoryFeature;
+MCPHandler.prototype.isBatteryFeature = isBatteryFeature;
+MCPHandler.prototype.isWritableSensorFeature = isWritableSensorFeature;
+MCPHandler.prototype.findBySimilarity = findBySimilarity;
+MCPHandler.prototype.formatValue = formatValue;
+MCPHandler.prototype.proxy = proxy;
+
+module.exports = MCPHandler;

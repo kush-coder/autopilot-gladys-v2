@@ -1,0 +1,121 @@
+const Promise = require('bluebird');
+const fs = require('fs');
+
+const db = require('../../models');
+const logger = require('../../utils/logger');
+const { SYSTEM_VARIABLE_NAMES } = require('../../utils/constants');
+
+/**
+ * @description Uninstall an external integration. Removes everything:
+ * container, sub-containers and their private network, data folder,
+ * devices, config variables, the t_service row, and finally the Docker images
+ * that were pulled for it and are not shared with another integration. There is no
+ * "keep the devices" option: t_device.service_id is a mandatory FK and
+ * orphan devices don't exist in the model — the user gets everything back
+ * through Discovery on reinstall.
+ * @param {string} selector - The selector of the external integration.
+ * @returns {Promise} Resolve when the integration is fully removed.
+ * @example
+ * await gladys.externalIntegration.uninstall('ext-dev-my-integration');
+ */
+async function uninstall(selector) {
+  const service = await this.getBySelector(selector);
+  this.clearTimers(service.id);
+  this.abortImagePull(service.id);
+  const connection = this.connections.get(service.id);
+  if (connection) {
+    try {
+      connection.terminate();
+    } catch (e) {
+      logger.debug(e);
+    }
+    this.connections.delete(service.id);
+  }
+  if (service.container_id) {
+    try {
+      await this.system.removeContainer(service.container_id, { force: true });
+    } catch (e) {
+      logger.warn(`Unable to remove container of integration ${selector}`, e);
+    }
+  }
+  try {
+    await this.removeSubContainers(service);
+  } catch (e) {
+    logger.warn(`Unable to remove sub-containers of integration ${selector}`, e);
+  }
+  // the data folder goes too (sub-container volumes, /data of the main
+  // container): uninstall leaves nothing behind
+  try {
+    const { basePathOnContainer } = await this.system.getGladysBasePath();
+    await fs.promises.rm(`${basePathOnContainer}/external-integrations/${service.selector}`, {
+      recursive: true,
+      force: true,
+    });
+  } catch (e) {
+    logger.warn(`Unable to remove data folder of integration ${selector}`, e);
+  }
+  // uninstalling the selected TTS provider returns the instance to the Gladys
+  // Plus default: no dangling selector in the system variable failing every
+  // announcement until an admin notices (capabilities/tts-type.md)
+  const selectedTtsProvider = await this.variable.getValue(SYSTEM_VARIABLE_NAMES.TTS_ACTIVE_PROVIDER);
+  if (selectedTtsProvider === service.name) {
+    await this.variable.destroy(SYSTEM_VARIABLE_NAMES.TTS_ACTIVE_PROVIDER);
+  }
+  const devices = await db.Device.findAll({ where: { service_id: service.id } });
+  await Promise.each(devices, (device) => this.device.destroy(device.selector));
+  // Calendars of a calendar-type integration are removed explicitly (all
+  // users), never left to the service_id FK cascade (capabilities/calendar-type.md) —
+  // and their viewers are notified, or a shared calendar would stay
+  // displayed on other users' calendar views until a manual refresh.
+  const calendars = await db.Calendar.findAll({
+    where: { service_id: service.id },
+    attributes: ['selector', 'shared', 'user_id'],
+  });
+  await db.Calendar.destroy({ where: { service_id: service.id } });
+  // partitioned by prior visibility, per owner: broadcasting a user's whole
+  // set as soon as one calendar is shared would leak the selectors of their
+  // private calendars to every connected user
+  const calendarsByUser = new Map();
+  calendars.forEach((calendar) => {
+    calendarsByUser.set(calendar.user_id, [...(calendarsByUser.get(calendar.user_id) || []), calendar]);
+  });
+  calendarsByUser.forEach((userCalendars, userId) => this.notifyCalendarsUpdated(userId, userCalendars));
+  await db.Variable.destroy({ where: { service_id: service.id } });
+  await db.Service.destroy({ where: { id: service.id } });
+  // uninstalling the selected AI provider silently returns the instance to
+  // the Gladys Plus default: no dangling selector in the variable. Read
+  // after the row deletion: a selection written while this uninstall was
+  // running (setAiProvider validated the row before it went) is caught
+  // here, and one written after it is rolled back by setAiProvider's own
+  // re-check of the row — both interleavings end on Gladys Plus
+  const selectedAiProvider = await this.variable.getValue(SYSTEM_VARIABLE_NAMES.AI_PROVIDER);
+  if (selectedAiProvider === service.selector) {
+    await this.variable.destroy(SYSTEM_VARIABLE_NAMES.AI_PROVIDER);
+  }
+  this.stateManager.deleteState('service', service.name);
+  this.stateManager.deleteState('serviceById', service.id);
+  this.discoveredDevices.delete(service.id);
+  this.connectionStatuses.delete(service.id);
+  this.clearWidgetCaches(service);
+  this.startedAt.delete(service.id);
+  this.stateRateLimits.delete(service.id);
+  this.aiChatInFlight.delete(service.id);
+  this.calendarWriteRateLimits.delete(service.id);
+  this.networkDiscoveryActiveScanTimes.delete(service.id);
+  // its contracts stay (provider_service_id nulled by the FK), its calendars are orphaned
+  this.energyCalendarRefreshTimes.delete(service.id);
+  const externalIdPrefix = `ext:${service.selector}:`;
+  [...this.cameraImageRateLimits.keys()]
+    .filter((externalId) => externalId.startsWith(externalIdPrefix))
+    .forEach((externalId) => this.cameraImageRateLimits.delete(externalId));
+  // last, once the row is gone: the in-use check reads the DB, so running it
+  // before the destroy would find this very integration and spare its images
+  await this.removeImages([
+    service.docker_image,
+    ...this.getManifestContainers(service).map((entry) => entry.docker_image),
+  ]);
+}
+
+module.exports = {
+  uninstall,
+};

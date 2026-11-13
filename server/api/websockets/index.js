@@ -1,0 +1,226 @@
+const WebSocket = require('ws');
+const { parseWebsocketMessage, formatWebsocketMessage } = require('../../utils/websocketUtils');
+const { EVENTS, WEBSOCKET_MESSAGE_TYPES, ERROR_MESSAGES } = require('../../utils/constants');
+const logger = require('../../utils/logger');
+
+const WebsocketManager = function WebsocketManager(wss, gladys) {
+  this.wss = wss;
+  this.gladys = gladys;
+  this.connections = {};
+  this.gladys.event.on(EVENTS.WEBSOCKET.SEND, (event) => this.sendMessageUser(event));
+  this.gladys.event.on(EVENTS.WEBSOCKET.SEND_ALL, (event) => this.sendMessageAllUsers(event));
+};
+
+/**
+ * @description Send a websocket message on one connection of a user. The
+ * connection of a revoked session (logged out, password changed) is closed
+ * instead, so it stops receiving the user's data.
+ * @param {object} userConnection - The connection of the user.
+ * @param {string} message - The formatted message to send.
+ * @example
+ * sendToConnection(userConnection, message);
+ */
+function sendToConnection(userConnection, message) {
+  if (userConnection.sessionId && this.gladys.session.isRevoked(userConnection.sessionId)) {
+    userConnection.client.close(4000, ERROR_MESSAGES.INVALID_ACCESS_TOKEN);
+  } else {
+    userConnection.client.send(message);
+  }
+}
+
+/**
+ * @description Send a websocket message to the user.
+ * @param {object} event - The event to send.
+ * @param {string} event.type - The type of event to send.
+ * @param {object} event.payload - The payload of the event containing data.
+ * @param {string} event.userId - The userId to send the message to.
+ * @example
+ * sendMessageUser(event);
+ */
+function sendMessageUser({ type, payload, userId }) {
+  if (!this.connections[userId]) {
+    return;
+  }
+  this.connections[userId].forEach((userConnection) => {
+    if (userConnection && userConnection.client && userConnection.client.readyState === WebSocket.OPEN) {
+      this.sendToConnection(userConnection, formatWebsocketMessage(type, payload));
+    }
+  });
+}
+
+/**
+ * @description Send a websocket message to all user.
+ * @param {object} event - Event.
+ * @param {string} event.type - Type of event.
+ * @param {object} event.payload - Payload to send.
+ * @example
+ * sendMessageAllUsers(event);
+ */
+function sendMessageAllUsers({ type, payload }) {
+  const usersIds = Object.keys(this.connections);
+  usersIds.forEach((userId) => {
+    this.connections[userId].forEach((userConnection) => {
+      if (userConnection && userConnection.client && userConnection.client.readyState === WebSocket.OPEN) {
+        this.sendToConnection(userConnection, formatWebsocketMessage(type, payload));
+      }
+    });
+  });
+}
+
+/**
+ * @description When a user is connected.
+ * @param {object} user - User Object.
+ * @param {object} client - Websocket client.
+ * @param {string} [sessionId] - Session the client authenticated with.
+ * @returns {null} Return when finished.
+ * @example
+ * userConnected(user, ws, '0a5f7305-4faf-42b3-aeb2-fbc0217c4855');
+ */
+function userConnected(user, client, sessionId = null) {
+  logger.debug(`User ${user.firstname} connected in websocket`);
+  if (!this.connections[user.id]) {
+    this.connections[user.id] = [];
+  }
+  const connectionIndex = this.connections[user.id].findIndex((elem) => elem.client === client);
+
+  if (connectionIndex === -1) {
+    this.connections[user.id].push({
+      user,
+      client,
+      sessionId,
+    });
+  } else {
+    // the client authenticated again on the same socket: it now uses this session
+    this.connections[user.id][connectionIndex].sessionId = sessionId;
+  }
+
+  // Send a message to the frontend to tell it's connected
+  this.sendMessageUser({
+    type: WEBSOCKET_MESSAGE_TYPES.AUTHENTICATION.CONNECTED,
+    payload: {},
+    userId: user.id,
+  });
+
+  return null;
+}
+
+/**
+ * @description When a user is disconnected.
+ * @param {object} user - User Object.
+ * @param {object} client - Websocket client.
+ * @returns {null} Return when finished.
+ * @example
+ * userDisconnected(user, ws);
+ */
+function userDisconnected(user, client) {
+  logger.debug(`User ${user.firstname} connected in websocket`);
+  if (!this.connections[user.id]) {
+    this.connections[user.id] = [];
+  }
+  const connectionIndex = this.connections[user.id].findIndex((elem) => elem.client === client);
+
+  if (connectionIndex !== -1) {
+    this.connections[user.id].splice(connectionIndex, 1);
+  }
+
+  return null;
+}
+
+/**
+ * @description Init websocket server.
+ * @returns {null} Returns when finished.
+ * @example
+ * init();
+ */
+function init() {
+  this.wss.on('connection', (ws) => {
+    let user;
+    let integrationService;
+    let authenticated = false;
+    ws.on('close', () => {
+      if (user) {
+        this.userDisconnected(user, ws);
+      }
+      if (integrationService) {
+        this.gladys.externalIntegration.integrationDisconnected(integrationService, ws).catch((e) => logger.warn(e));
+      }
+    });
+    ws.on('message', async (data) => {
+      const parsedMessage = parseWebsocketMessage(data);
+      switch (parsedMessage.type) {
+        case WEBSOCKET_MESSAGE_TYPES.AUTHENTICATION.REQUEST:
+          try {
+            // we validate the token
+            let payload;
+            try {
+              payload = this.gladys.session.validateAccessToken(parsedMessage.payload.accessToken, 'dashboard:write');
+            } catch (e) {
+              logger.debug(`Cannot validate websocket token with dashboard:write (${e}), trying with alarm:write`);
+              payload = this.gladys.session.validateAccessToken(parsedMessage.payload.accessToken, 'alarm:write');
+            }
+            user = await this.gladys.user.getById(payload.user_id);
+            authenticated = true;
+            this.userConnected(user, ws, payload.session_id);
+          } catch (e) {
+            ws.close(4000, ERROR_MESSAGES.INVALID_ACCESS_TOKEN);
+          }
+          break;
+        case WEBSOCKET_MESSAGE_TYPES.AUTHENTICATION.INTEGRATION_REQUEST:
+          try {
+            // we validate the integration JWT (signature + audience + token_version)
+            const service = await this.gladys.externalIntegration.validateToken(parsedMessage.payload.token);
+            integrationService = service;
+            authenticated = true;
+            await this.gladys.externalIntegration.integrationConnected(service, ws);
+            ws.send(formatWebsocketMessage(WEBSOCKET_MESSAGE_TYPES.AUTHENTICATION.CONNECTED, {}));
+          } catch (e) {
+            logger.debug(`Cannot authenticate external integration in websocket`, e);
+            ws.close(4000, ERROR_MESSAGES.INVALID_ACCESS_TOKEN);
+          }
+          break;
+        case WEBSOCKET_MESSAGE_TYPES.EXTERNAL_INTEGRATION.COMMAND_RESULT:
+          if (integrationService) {
+            this.gladys.externalIntegration.handleCommandResult(integrationService, parsedMessage.payload);
+          }
+          break;
+        case WEBSOCKET_MESSAGE_TYPES.EXTERNAL_INTEGRATION.HEARTBEAT:
+          if (integrationService) {
+            await this.gladys.externalIntegration.handleHeartbeat(integrationService);
+          }
+          break;
+        case WEBSOCKET_MESSAGE_TYPES.EXTERNAL_INTEGRATION.WEATHER_REFRESH:
+          if (integrationService) {
+            this.gladys.externalIntegration.handleWeatherRefresh(integrationService);
+          }
+          break;
+        case WEBSOCKET_MESSAGE_TYPES.EXTERNAL_INTEGRATION.WIDGET_REFRESH:
+          if (integrationService) {
+            this.gladys.externalIntegration.handleWidgetRefresh(integrationService, parsedMessage.payload);
+          }
+          break;
+        case WEBSOCKET_MESSAGE_TYPES.EXTERNAL_INTEGRATION.ENERGY_CALENDAR_REFRESH:
+          if (integrationService) {
+            await this.gladys.externalIntegration.handleEnergyCalendarRefresh(integrationService);
+          }
+          break;
+        default:
+          logger.debug(`Message type not handled`);
+      }
+    });
+    setTimeout(() => {
+      if (authenticated === false) {
+        ws.terminate();
+      }
+    }, 5000);
+  });
+  return null;
+}
+
+WebsocketManager.prototype.init = init;
+WebsocketManager.prototype.userConnected = userConnected;
+WebsocketManager.prototype.userDisconnected = userDisconnected;
+WebsocketManager.prototype.sendMessageUser = sendMessageUser;
+WebsocketManager.prototype.sendToConnection = sendToConnection;
+WebsocketManager.prototype.sendMessageAllUsers = sendMessageAllUsers;
+
+module.exports = WebsocketManager;

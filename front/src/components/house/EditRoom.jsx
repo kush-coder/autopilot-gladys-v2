@@ -1,0 +1,57 @@
+import { Component } from 'preact';
+import { Text, Localizer } from 'preact-i18n';
+import cx from 'classnames';
+
+import style from './style.css';
+
+class EditRoom extends Component {
+  removeRoomLocal = () => {
+    this.props.removeRoom(this.props.index);
+  };
+
+  editRoomLocal = e => {
+    e.preventDefault();
+
+    this.props.editRoom(this.props.index, 'name', e.target.value);
+  };
+
+  constructor(props) {
+    super(props);
+    this.state = { initialName: this.props.room.name };
+  }
+
+  render({ room }, { initialName }) {
+    if (room.to_delete === true) {
+      return null;
+    }
+
+    return (
+      <div class={style.roomItem}>
+        <div class="input-group">
+          <input
+            type="text"
+            class="form-control form-control-sm"
+            placeholder={initialName}
+            value={room.name}
+            onInput={this.editRoomLocal}
+          />
+          <div class="input-group-append">
+            <Localizer>
+              <button
+                type="button"
+                class={cx('input-group-text', 'cursor-pointer', style.roomRemoveButton)}
+                onClick={this.removeRoomLocal}
+                title={<Text id="housesSettings.removeRoom" />}
+                aria-label={<Text id="housesSettings.removeRoom" />}
+              >
+                <i class="fe fe-x" />
+              </button>
+            </Localizer>
+          </div>
+        </div>
+      </div>
+    );
+  }
+}
+
+export default EditRoom;

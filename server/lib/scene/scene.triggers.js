@@ -1,0 +1,263 @@
+const cloneDeep = require('lodash.clonedeep');
+const dayjs = require('dayjs');
+const utc = require('dayjs/plugin/utc');
+const timezonePlugin = require('dayjs/plugin/timezone');
+
+const logger = require('../../utils/logger');
+const { EVENTS, ANY_CHANGE_OPERATOR, TIME_RANGE_EVENTS } = require('../../utils/constants');
+const { compare } = require('../../utils/compare');
+const { isInTimeRanges, resolveTriggerTimeRanges } = require('../../utils/timeRanges');
+
+dayjs.extend(utc);
+dayjs.extend(timezonePlugin);
+
+const matchSunEvent = (self, sceneSelector, event, trigger) =>
+  event.house.selector === trigger.house && (event.offset || 0) === (trigger.offset || 0);
+
+// severity scale of the generic weather alerts (B.18)
+const WEATHER_ALERT_SEVERITY_RANK = {
+  minor: 1,
+  moderate: 2,
+  severe: 3,
+  extreme: 4,
+};
+
+// same house, phenomenon type filter ('any' or absent = every type),
+// minimal severity (absent = minor, so every alert matches)
+const matchWeatherAlert = (self, sceneSelector, event, trigger) =>
+  event.house === trigger.house &&
+  (!trigger.weather_alert_type ||
+    trigger.weather_alert_type === 'any' ||
+    event.alert.type === trigger.weather_alert_type) &&
+  WEATHER_ALERT_SEVERITY_RANK[event.alert.severity] >=
+    (WEATHER_ALERT_SEVERITY_RANK[trigger.weather_alert_severity] || 1);
+
+// Filters left empty by the scene author are wildcards
+const isWildcardFilter = (expected) =>
+  expected === null || expected === undefined || expected === '' || (Array.isArray(expected) && expected.length === 0);
+
+// Scene trigger declared by an external integration: the integration fires a
+// typed event with data (POST /api/integration/v1/scene/event), the core
+// compares it with the filters the scene author configured. The matching
+// model is deliberately simple — equality and membership on the declared
+// fields — thresholds and durations belong to device features.
+// `event.filters` is complete by construction (every key currently declared,
+// null when absent from this event), so a stored key missing from it is a
+// filter removed by an update: stale, skipped without a manifest lookup.
+// On a match the checker returns the REDUCED trigger event the actions see
+// ({{triggerEvent.data.<key>}}): the matcher's filters never enter the scope.
+const matchExternalIntegrationSceneEvent = (self, sceneSelector, event, trigger) => {
+  if (event.integration !== trigger.integration || event.trigger_key !== trigger.trigger_key) {
+    return false;
+  }
+  const storedFields = trigger.fields || {};
+  const filters = event.filters || {};
+  const matched = Object.keys(storedFields).every((key) => {
+    const expected = storedFields[key];
+    const actual = filters[key];
+    if (actual === undefined || isWildcardFilter(expected)) {
+      return true;
+    }
+    if (actual === null) {
+      return false;
+    }
+    if (Array.isArray(expected)) {
+      return expected.includes(actual);
+    }
+    return actual === expected;
+  });
+  if (!matched) {
+    return false;
+  }
+  return {
+    type: event.type,
+    integration: event.integration,
+    trigger_key: event.trigger_key,
+    data: cloneDeep(event.data || {}),
+  };
+};
+
+const triggersFunc = {
+  [EVENTS.DEVICE.NEW_STATE]: (self, sceneSelector, event, trigger) => {
+    // Multi-select triggers store their features in `device_features`, legacy triggers
+    // a single one in `device_feature`. The trigger matches as soon as the event concerns
+    // one of the selected features (OR logic), so the rest of the check — including the
+    // `for_duration` timer key — is scoped to the event's feature, keeping one independent
+    // timer per selected feature. An empty array (rejected by validation but possible in
+    // hand-edited data) falls back to the legacy field instead of never matching.
+    const triggerDeviceFeatures =
+      trigger.device_features && trigger.device_features.length > 0
+        ? trigger.device_features
+        : [trigger.device_feature];
+    if (!triggerDeviceFeatures.includes(event.device_feature)) {
+      return false;
+    }
+
+    // "any change" trigger: no value is configured, the trigger fires as soon as the feature
+    // reports a value different from the previous one (a device re-sending the same value
+    // is not a state change). A change is instantaneous, so `threshold_only` (which only
+    // exists to de-duplicate a condition staying true) and `for_duration` (which waits for a
+    // condition to hold) have nothing to hold on to: they are ignored, and no timer is
+    // scheduled. The UI hides both options in that mode.
+    if (trigger.operator === ANY_CHANGE_OPERATOR) {
+      return compare(trigger.operator, event.last_value, event.previous_value);
+    }
+
+    // We verify if both old value and new value validate the rule
+    const newValueValidateRule = compare(trigger.operator, event.last_value, trigger.value);
+    const previousValueValidateRule = compare(trigger.operator, event.previous_value, trigger.value);
+
+    const triggerDurationKey = `device.new-state.${sceneSelector}.${event.device_feature}:${trigger.operator}:${trigger.value}`;
+
+    // If the previous value was validating the rule, and the new value is not
+    // We clear any timeout for this trigger
+    if (previousValueValidateRule && !newValueValidateRule && self.checkTriggersDurationTimer.get(triggerDurationKey)) {
+      logger.info(
+        `Cancelling timer on trigger for device_feature ${event.device_feature}, because condition is no longer valid`,
+      );
+      clearTimeout(self.checkTriggersDurationTimer.get(triggerDurationKey));
+      self.checkTriggersDurationTimer.delete(triggerDurationKey);
+    }
+
+    if (trigger.for_duration === undefined) {
+      // If the trigger is only a threshold_only, we only validate the trigger is the rule has been validated
+      // and was not validated with the previous value
+      if (trigger.threshold_only === true && !Number.isNaN(event.previous_value)) {
+        return newValueValidateRule && !previousValueValidateRule;
+      }
+
+      return newValueValidateRule;
+    }
+
+    // If the "for_duration_finished" is here, it means we are
+    // checking the state after the timeout
+    if (event.for_duration_finished && triggerDurationKey === event.trigger_duration_key) {
+      logger.info(`Scene trigger device.new-state: Timer for sensor ${event.device_feature} has finished.`);
+      clearTimeout(self.checkTriggersDurationTimer.get(triggerDurationKey));
+      self.checkTriggersDurationTimer.delete(triggerDurationKey);
+      return newValueValidateRule;
+    }
+
+    const isValidatedIfThresholdOnly =
+      trigger.threshold_only && !Number.isNaN(event.previous_value)
+        ? newValueValidateRule && !previousValueValidateRule
+        : true;
+
+    if (newValueValidateRule && isValidatedIfThresholdOnly) {
+      // If the timeout already exist, don't re-create it
+      const timeoutAlreadyExist = self.checkTriggersDurationTimer.get(triggerDurationKey);
+      if (timeoutAlreadyExist) {
+        logger.info(`Timer for "${event.device_feature}" already exist, not re-creating.`);
+        return false;
+      }
+      logger.info(
+        `Scheduling timer to check for device_feature "${event.device_feature}" state in ${trigger.for_duration}ms`,
+      );
+      // Create a timeout
+      const timeoutId = setTimeout(() => {
+        const lastValue = self.stateManager.get('deviceFeature', event.device_feature).last_value;
+        self.event.emit(EVENTS.TRIGGERS.CHECK, {
+          ...cloneDeep(event),
+          previous_value: event.last_value,
+          last_value: lastValue,
+          for_duration_finished: true,
+          trigger_duration_key: triggerDurationKey,
+        });
+      }, trigger.for_duration);
+      // Save the timeoutId in case we need to cancel it later
+      self.checkTriggersDurationTimer.set(triggerDurationKey, timeoutId);
+      // Return false, as we'll check this only in the future
+      return false;
+    }
+
+    return false;
+  },
+  [EVENTS.TIME.CHANGED]: (self, sceneSelector, event, trigger) => {
+    if (event.key !== trigger.key) {
+      return false;
+    }
+    // A time-range trigger carries which side of the range fired, so the scene can react
+    // differently to a start and to an end. It is exposed to the actions through the scope
+    // (`scope.triggerEvent`, written by scene.checkTrigger).
+    // `event` is the single object checkTrigger walks every scene with, so writing on it
+    // is only safe because the key guard above lets at most one trigger through: keys are
+    // uuid v4, assigned per trigger in addScene. Keep that guard before this branch.
+    if (trigger.scheduler_type === 'time-range') {
+      const instant = dayjs();
+      const now = dayjs.tz(instant, self.timezone);
+      // A start is computed on the current minute too, not taken as "inside": on the
+      // spring-forward night, cron moves a 02:30 edge to 03:30 but leaves a 03:15 one where
+      // it is, so a 02:30 -> 03:15 range starts after its own end. Taken as inside, that
+      // start switched the device on until the next day's end, about 24 h later. On any
+      // other night the start minute is inside the range (its start is included). A job a
+      // few milliseconds early lands in the minute before its start, so a start also tries
+      // the next minute: 11:59 still answers for a 12:00 start, while 03:31 stays outside
+      // both spring-forward cases. The next minute is taken from the instant, not with
+      // now.add(): across a DST change, add() keeps the old offset when the system runs in
+      // UTC, and 01:59 + 1 minute became 02:00, a minute that does not exist that night.
+      //
+      // The whole planning of the scene answers, not just the ranges of the trigger which
+      // fired: the days are configured per trigger, so a "weekdays + weekend" planning is
+      // necessarily two triggers, and the end of one of them must not report the scene as
+      // outside while the other one still covers this minute. `condition.in-time-range` trusts
+      // this flag as soon as the key belongs to the scene, so the union has to be computed
+      // here rather than left to the condition.
+      const scene = self.scenes && self.scenes[sceneSelector];
+      // The scene is always in the store when a job of its own fires; falling back on the
+      // trigger which fired keeps the answer sane if it somehow is not.
+      const sceneTriggers = (scene && scene.triggers) || [trigger];
+      const timeRanges = sceneTriggers
+        .filter((sceneTrigger) => sceneTrigger.scheduler_type === 'time-range')
+        .flatMap((sceneTrigger) =>
+          resolveTriggerTimeRanges(sceneTrigger).filter(
+            // The range which just ended no longer counts — its end is excluded — but every
+            // other one still does: two consecutive ranges ("10:00 -> 12:00" then
+            // "12:00 -> 14:00"), or two overlapping ones, keep the scene inside.
+            // A resume replays nothing, so it keeps them all.
+            (range, index) =>
+              event.range_event !== TIME_RANGE_EVENTS.END ||
+              sceneTrigger.key !== trigger.key ||
+              index !== event.range_index,
+          ),
+        );
+      event.in_range =
+        isInTimeRanges(timeRanges, now) ||
+        (event.range_event === TIME_RANGE_EVENTS.START &&
+          isInTimeRanges(timeRanges, dayjs.tz(instant.add(1, 'minute'), self.timezone)));
+      logger.debug(`Scene trigger time-range: ${event.range_event} event, in_range = ${event.in_range}.`);
+    }
+    return true;
+  },
+  [EVENTS.TIME.SUNRISE]: matchSunEvent,
+  [EVENTS.TIME.SUNSET]: matchSunEvent,
+  [EVENTS.USER_PRESENCE.BACK_HOME]: (self, sceneSelector, event, trigger) =>
+    event.house === trigger.house && event.user === trigger.user,
+  [EVENTS.USER_PRESENCE.LEFT_HOME]: (self, sceneSelector, event, trigger) =>
+    event.house === trigger.house && event.user === trigger.user,
+  [EVENTS.HOUSE.EMPTY]: (self, sceneSelector, event, trigger) => event.house === trigger.house,
+  [EVENTS.HOUSE.NO_LONGER_EMPTY]: (self, sceneSelector, event, trigger) => event.house === trigger.house,
+  [EVENTS.AREA.USER_ENTERED]: (self, sceneSelector, event, trigger) =>
+    event.user === trigger.user && event.area === trigger.area,
+  [EVENTS.AREA.USER_LEFT]: (self, sceneSelector, event, trigger) =>
+    event.user === trigger.user && event.area === trigger.area,
+  [EVENTS.ALARM.ARM]: (self, sceneSelector, event, trigger) => event.house === trigger.house,
+  [EVENTS.ALARM.ARMING]: (self, sceneSelector, event, trigger) => event.house === trigger.house,
+  [EVENTS.ALARM.DISARM]: (self, sceneSelector, event, trigger) => event.house === trigger.house,
+  [EVENTS.ALARM.PARTIAL_ARM]: (self, sceneSelector, event, trigger) => event.house === trigger.house,
+  [EVENTS.ALARM.PANIC]: (self, sceneSelector, event, trigger) => event.house === trigger.house,
+  [EVENTS.ALARM.TOO_MANY_CODES_TESTS]: (self, sceneSelector, event, trigger) => event.house === trigger.house,
+  [EVENTS.SYSTEM.START]: () => true,
+  [EVENTS.MQTT.RECEIVED]: (self, sceneSelector, event, trigger) =>
+    event.topic === trigger.topic && (!trigger.message || trigger.message === event.message),
+  [EVENTS.WEATHER.ALERT_RAISED]: matchWeatherAlert,
+  [EVENTS.WEATHER.ALERT_ENDED]: matchWeatherAlert,
+  // energy contract price change (spec 8.2): a trigger without a contract selector
+  // matches every contract, one with a selector only that contract
+  [EVENTS.ENERGY_CONTRACT.PRICE_CHANGED]: (self, sceneSelector, event, trigger) =>
+    !trigger.energy_contract || event.contract === trigger.energy_contract,
+  [EVENTS.EXTERNAL_INTEGRATION.SCENE_EVENT]: matchExternalIntegrationSceneEvent,
+};
+
+module.exports = {
+  triggersFunc,
+};

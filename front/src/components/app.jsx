@@ -1,0 +1,524 @@
+import { h, Component } from 'preact';
+import { Router } from 'preact-router';
+import createStore from 'unistore';
+import get from 'get-value';
+import config from '../config';
+import { Provider, connect } from 'unistore/preact';
+import AsyncRoute from 'preact-async-route';
+import { IntlProvider } from 'preact-i18n';
+import translations from '../config/i18n';
+import actions from '../actions/main';
+import { EXTERNAL_INTEGRATION_UPDATES_REFRESH_INTERVAL_MS } from '../actions/externalIntegrationUpdates';
+import { catalogCategories } from '../config/integrations';
+
+import { getDefaultState } from '../utils/getDefaultState';
+
+import Header from './header';
+import Layout from './layout';
+import Redirect from './router/Redirect';
+import Login from '../routes/login';
+import Locked from '../routes/locked';
+import Error from '../routes/error';
+import ForgotPassword from '../routes/forgot-password';
+import ResetPassword from '../routes/reset-password';
+
+// Gateway
+import LoginGateway from '../routes/login-gateway';
+import LinkGatewayUser from '../routes/gateway-setup';
+import SignupGateway from '../routes/signup-gateway';
+import ConfigureTwoFactorGateway from '../routes/gateway-configure-two-factor';
+import GatewayForgotPassword from '../routes/gateway-forgot-password';
+import GatewayResetPassword from '../routes/gateway-reset-password';
+import GatewayResetTwoFactor from '../routes/gateway-reset-two-factor';
+import GatewayConfirmEmail from '../routes/gateway-confirm-email';
+import GoogleHomeGateway from '../routes/integration/all/google-home-gateway';
+import AlexaGateway from '../routes/integration/all/alexa-gateway';
+import EnedisGateway from '../routes/integration/all/enedis-gateway/Welcome';
+import EnedisGatewayUsagePoints from '../routes/integration/all/enedis-gateway/UsagePoints';
+
+import SignupWelcomePage from '../routes/signup/1-welcome';
+import SignupCreateAccountLocal from '../routes/signup/2-create-account-local';
+import SignupCreateAccountGladysGateway from '../routes/signup/2-create-account-gladys-gateway';
+import SignupPreferences from '../routes/signup/3-preferences';
+import SignupConfigureHouse from '../routes/signup/4-configure-house';
+import SignupSuccess from '../routes/signup/5-success';
+
+// Dashboard
+import Dashboard from '../routes/dashboard';
+import NewDashboard from '../routes/dashboard/new-dashboard';
+import EditDashboard from '../routes/dashboard/edit-dashboard';
+
+import IntegrationPage from '../routes/integration';
+import DevicesListPage from '../routes/devices';
+import HistoryPage from '../routes/history';
+import ChatPage from '../routes/chat';
+import MapPage from '../routes/map';
+import MapNewAreaPage from '../routes/map/NewArea';
+import CalendarPage from '../routes/calendar';
+import ScenePage from '../routes/scene';
+import NewScenePage from '../routes/scene/new-scene';
+import DuplicateScenePage from '../routes/scene/duplicate-scene';
+import EditScenePage from '../routes/scene/edit-scene';
+import ProfilePage from '../routes/profile';
+import SettingsSessionPage from '../routes/settings/settings-session';
+import SettingsSecurityPage from '../routes/settings/settings-security';
+import SettingsHousePage from '../routes/settings/settings-house';
+import SettingsUserPage from '../routes/settings/settings-users';
+import SettingsEditUserPage from '../routes/settings/settings-users/edit-user';
+import SettingsCreateUserPage from '../routes/settings/settings-users/create-user';
+import SettingsSystemPage from '../routes/settings/settings-system';
+import SettingsServicePage from '../routes/settings/settings-service';
+import SettingsGateway from '../routes/settings/settings-gateway';
+import SettingsBackup from '../routes/settings/settings-backup';
+import SettingsBilling from '../routes/settings/settings-billing';
+import SettingsGatewayOpenApi from '../routes/settings/settings-gateway-open-api';
+import SettingsBackgroundJobs from '../routes/settings/settings-background-jobs';
+
+// Integrations
+import TelegramPage from '../routes/integration/all/telegram';
+import AlexaWelcomePage from '../routes/integration/all/alexa-gateway/welcome';
+import GoogleHomeWelcomePage from '../routes/integration/all/google-home-gateway/welcome';
+import HomeKitPage from '../routes/integration/all/homekit';
+import OwntracksWelcomePage from '../routes/integration/all/owntracks/welcome';
+import CalDAVAccountPage from '../routes/integration/all/caldav/account-page';
+import CalDAVSyncPage from '../routes/integration/all/caldav/sync-page';
+import CalDAVSharePage from '../routes/integration/all/caldav/share-page';
+import OpenWeatherPage from '../routes/integration/all/openweather';
+import PhilipsHueSetupPage from '../routes/integration/all/philips-hue/setup-page';
+import PhilipsHueDevicePage from '../routes/integration/all/philips-hue/device-page';
+import TPLinkDevicePage from '../routes/integration/all/tp-link/device-page';
+import RtspCameraPage from '../routes/integration/all/rtsp-camera';
+import XiaomiPage from '../routes/integration/all/xiaomi';
+import EditXiaomiPage from '../routes/integration/all/xiaomi/edit-page';
+import NextcloudTalkPage from '../routes/integration/all/nextcloud-talk';
+import MCPPage from '../routes/integration/all/mcp';
+
+// Broadlink integration
+import BroadlinkDevicePage from '../routes/integration/all/broadlink/device-page';
+import BroadlinkRemoteSetupPage from '../routes/integration/all/broadlink/remote-page';
+import BroadlinkPeripheralPage from '../routes/integration/all/broadlink/peripheral-page';
+
+// LAN-Manager integration
+import LANManagerDevicePage from '../routes/integration/all/lan-manager/device-page';
+import LANManagerDiscoverPage from '../routes/integration/all/lan-manager/discover-page';
+import LANManagerSettingsPage from '../routes/integration/all/lan-manager/settings-page';
+
+// MQTT integration
+import MqttDevicePage from '../routes/integration/all/mqtt/device-page';
+import MqttDeviceSetupPage from '../routes/integration/all/mqtt/device-page/setup';
+import MqttSetupPage from '../routes/integration/all/mqtt/setup-page';
+import MqttDebugPage from '../routes/integration/all/mqtt/debug-page/Debug';
+import MqttDiscoveryPage from '../routes/integration/all/mqtt/discovery-page';
+
+// Zigbee2mqtt
+import Zigbee2mqttPage from '../routes/integration/all/zigbee2mqtt/device-page';
+import Zigbee2mqttDiscoverPage from '../routes/integration/all/zigbee2mqtt/discover-page';
+import Zigbee2mqttSetupPage from '../routes/integration/all/zigbee2mqtt/setup-page';
+import Zigbee2mqttEditPage from '../routes/integration/all/zigbee2mqtt/edit-page';
+
+// Tasmota
+import TasmotaPage from '../routes/integration/all/tasmota/device-page';
+import TasmotaEditPage from '../routes/integration/all/tasmota/edit-page';
+import TasmotaMqttDiscoverPage from '../routes/integration/all/tasmota/discover-mqtt';
+import TasmotaHttpDiscoverPage from '../routes/integration/all/tasmota/discover-http';
+
+// Integrations Bluetooth
+import BluetoothDevicePage from '../routes/integration/all/bluetooth/device-page';
+import BluetoothEditDevicePage from '../routes/integration/all/bluetooth/edit-page';
+import BluetoothSetupPage from '../routes/integration/all/bluetooth/setup-page';
+import BluetoothSetupPeripheralPage from '../routes/integration/all/bluetooth/setup-page/setup-peripheral';
+import BluetoothSettingsPage from '../routes/integration/all/bluetooth/settings-page';
+
+// EweLink
+import EweLinkPage from '../routes/integration/all/ewelink/device-page';
+import EweLinkEditPage from '../routes/integration/all/ewelink/edit-page';
+import EweLinkDiscoverPage from '../routes/integration/all/ewelink/discover-page';
+import EweLinkSetupPage from '../routes/integration/all/ewelink/setup-page';
+
+// Nuki
+import NukiPage from '../routes/integration/all/nuki';
+import NukiSetupPage from '../routes/integration/all/nuki/setup-page';
+import NukiMqttDiscoverPage from '../routes/integration/all/nuki/discover-mqtt';
+import NukiHttpDiscoverPage from '../routes/integration/all/nuki/discover-http';
+
+// AI integration
+import OpenAIPage from '../routes/integration/all/openai/index';
+
+// Tuya integration
+import TuyaPage from '../routes/integration/all/tuya/device-page';
+import TuyaEditPage from '../routes/integration/all/tuya/edit-page';
+import TuyaSetupPage from '../routes/integration/all/tuya/setup-page';
+import TuyaDiscoverPage from '../routes/integration/all/tuya/discover-page';
+
+// Netatmo integration
+import NetatmoPage from '../routes/integration/all/netatmo/device-page';
+import NetatmoSetupPage from '../routes/integration/all/netatmo/setup-page';
+import NetatmoDiscoverPage from '../routes/integration/all/netatmo/discover-page';
+
+// Sonos integration
+import SonosDevicePage from '../routes/integration/all/sonos/device-page';
+import SonosDiscoveryPage from '../routes/integration/all/sonos/discover-page';
+
+// Google Cast integration
+import GoogleCastDevicePage from '../routes/integration/all/google-cast/device-page';
+import GoogleCastDiscoveryPage from '../routes/integration/all/google-cast/discover-page';
+
+// Airplay integration
+import AirplayDevicePage from '../routes/integration/all/airplay/device-page';
+import AirplayDiscoveryPage from '../routes/integration/all/airplay/discover-page';
+
+// ZWaveJS-UI integration
+import ZwaveJSUIDevicePage from '../routes/integration/all/zwavejs-ui/device-page';
+import ZwaveJSUIDiscoveryPage from '../routes/integration/all/zwavejs-ui/discover-page';
+import ZwaveJSUISetupPage from '../routes/integration/all/zwavejs-ui/setup-page';
+
+// Matter integration
+import MatterDevices from '../routes/integration/all/matter/MatterDevices';
+import MatterDiscoverPage from '../routes/integration/all/matter/MatterDiscoverPage';
+import MatterSettingsPage from '../routes/integration/all/matter/MatterSettingsPage';
+
+// MELCloud integration
+import MELCloudPage from '../routes/integration/all/melcloud/device-page';
+import MELCloudEditPage from '../routes/integration/all/melcloud/edit-page';
+import MELCloudSetupPage from '../routes/integration/all/melcloud/setup-page';
+import MELCloudDiscoverPage from '../routes/integration/all/melcloud/discover-page';
+
+// NodeRed integration
+import NodeRedPage from '../routes/integration/all/node-red/setup-page';
+
+// Matterbridge integration
+import MatterbridgePage from '../routes/integration/all/matterbridge/setup-page';
+
+// Free Mobile integration
+import FreeMobilePage from '../routes/integration/all/free-mobile';
+// CallMeBot integration
+import CallMeBotPage from '../routes/integration/all/callmebot/setup-page';
+
+// Energy Monitoring integration
+import EnergyMonitoringIntegration from '../routes/integration/all/energy-monitoring/index';
+
+// External integrations (community integrations running in isolated Docker containers)
+import ExternalIntegrationDevicePage from '../routes/integration/all/external-integration/device-page';
+import ExternalIntegrationDiscoverPage from '../routes/integration/all/external-integration/discover-page';
+import ExternalIntegrationConfigPage from '../routes/integration/all/external-integration/config-page';
+import ExternalIntegrationSupervisionPage from '../routes/integration/all/external-integration/supervision-page';
+import ExternalIntegrationLogsPage from '../routes/integration/all/external-integration/logs-page';
+import ExternalIntegrationInstallPage from '../routes/integration/all/external-integration/install-page';
+import ExternalIntegrationOAuthCallbackPage from '../routes/integration/all/external-integration/oauth-callback-page';
+// Thermostat integration
+import ThermostatDevicePage from '../routes/integration/all/thermostat/device-page';
+import ThermostatEditPage from '../routes/integration/all/thermostat/edit-page';
+import ThermostatSchedulePage from '../routes/integration/all/thermostat/schedule-page';
+
+const defaultState = getDefaultState();
+const store = createStore(defaultState);
+
+const SafeAsyncRoute = props => (
+  <div class="async-route-wrapper">
+    <AsyncRoute {...props} loading={() => <div class="loading-placeholder" />} />
+  </div>
+);
+
+const AppRouter = connect(
+  'currentUrl,user,profilePicture,showDropDown,showCollapsedMenu,fullScreen,externalIntegrationsToUpdate,session,gatewayTrialDaysLeft,gatewayTrialHasPaymentMethod,gatewayTrialStripePortalKey,gatewayPaymentRequired,instanceGladysVersion',
+  actions
+)(props => (
+  <div id="app">
+    {/* The navigation rail lives OUTSIDE the Layout wrapper: it is chrome
+        shared by every page, while that wrapper carries the current page's
+        theme (the Horizon glass gate on integration URLs). Nested inside, the
+        rail inherited the theme's furniture rules on those URLs only. It is
+        fixed-positioned, so being a sibling of .page changes nothing to its
+        layout. */}
+    <Header
+      currentUrl={props.currentUrl}
+      user={props.user}
+      externalIntegrationsToUpdate={props.externalIntegrationsToUpdate}
+      fullScreen={props.fullScreen}
+      profilePicture={props.profilePicture}
+      toggleDropDown={props.toggleDropDown}
+      showDropDown={props.showDropDown}
+      closeDropDown={props.closeDropDown}
+      toggleCollapsedMenu={props.toggleCollapsedMenu}
+      showCollapsedMenu={props.showCollapsedMenu}
+      logout={props.logout}
+      session={props.session}
+      gatewayTrialDaysLeft={props.gatewayTrialDaysLeft}
+      gatewayTrialHasPaymentMethod={props.gatewayTrialHasPaymentMethod}
+      gatewayTrialStripePortalKey={props.gatewayTrialStripePortalKey}
+      refreshGatewayTrialState={props.refreshGatewayTrialState}
+      gatewayPaymentRequired={props.gatewayPaymentRequired}
+      instanceGladysVersion={props.instanceGladysVersion}
+      refreshInstanceVersionState={props.refreshInstanceVersionState}
+    />
+    <Layout currentUrl={props.currentUrl}>
+      <Router onChange={props.handleRoute}>
+        <Redirect path="/" to="/dashboard" />
+        {/** ROUTE WHICH ARE DIFFERENT IN GATEWAY MODE */}
+        {config.gatewayMode ? <LoginGateway path="/login" /> : <Login path="/login" />}
+        {config.gatewayMode ? (
+          <GatewayForgotPassword path="/forgot-password" />
+        ) : (
+          <ForgotPassword path="/forgot-password" />
+        )}
+        {config.gatewayMode ? (
+          <GatewayResetPassword path="/reset-password" />
+        ) : (
+          <ResetPassword path="/reset-password" />
+        )}
+        <Locked path="/locked" />
+        {config.gatewayMode && <LinkGatewayUser path="/link-gateway-user" />}
+        {config.gatewayMode && <SignupGateway path="/signup-gateway" />}
+        {config.gatewayMode && <ConfigureTwoFactorGateway path="/gateway-configure-two-factor" />}
+        {config.gatewayMode && <GatewayResetTwoFactor path="/reset-two-factor" />}
+        {config.gatewayMode && <GatewayConfirmEmail path="/confirm-email" />}
+        {config.gatewayMode && <SettingsBilling path="/dashboard/settings/billing" />}
+        {config.gatewayMode && <SettingsSecurityPage path="/dashboard/settings/security" />}
+        {/* the Gladys Plus users are managed with the Gladys users since 5.x: old links land there */}
+        {config.gatewayMode && <Redirect path="/dashboard/settings/gateway-users" to="/dashboard/settings/user" />}
+        {config.gatewayMode && <SettingsGatewayOpenApi path="/dashboard/settings/gateway-open-api" />}
+
+        {!config.gatewayMode && <SignupWelcomePage path="/signup" />}
+        {/** END OF ROUTES WHICH ARE DIFFERENT IN GATEWAY MODE */}
+        <SignupCreateAccountLocal path="/signup/create-account-local" />
+        <SignupCreateAccountGladysGateway path="/signup/create-account-gladys-gateway" />
+        <SignupPreferences path="/signup/preference" />
+        <SignupConfigureHouse path="/signup/configure-house" />
+        <SignupSuccess path="/signup/success" />
+        <SafeAsyncRoute path="/dashboard" component={Dashboard} />
+        <SafeAsyncRoute path="/dashboard/:dashboardSelector" component={Dashboard} />
+        <EditDashboard path="/dashboard/:dashboardSelector/edit" />
+        <NewDashboard path="/dashboard/create/new" />
+        {/* a plain element like the other catalog views, not an AsyncRoute:
+            preact-router then reuses the same page from one view to the next,
+            so a running "Update all" survives a visit to "All integrations" */}
+        <IntegrationPage path="/dashboard/integration" />
+
+        <IntegrationPage path="/dashboard/integration/favorites" category="favorites" />
+        <IntegrationPage path="/dashboard/integration/updates" category="updates" />
+        <IntegrationPage path="/dashboard/integration/installed" category="installed" />
+        {/* browse categories of the catalog (docs/specs/integration-catalog-categories.md):
+            display metadata decoupled from the technical `type` still carried
+            by the integration page URLs right below */}
+        {catalogCategories.map(({ key }) => (
+          <IntegrationPage path={`/dashboard/integration/${key}`} category={key} />
+        ))}
+        {/* legacy type-based catalog views (spec §5): a 1:1 bucket goes to its
+            new shelf, a bucket split across several shelves goes to the
+            catalog root — redirecting it to one shelf would hide the others */}
+        <Redirect path="/dashboard/integration/device" to="/dashboard/integration" />
+        <Redirect path="/dashboard/integration/communication" to="/dashboard/integration" />
+        <Redirect path="/dashboard/integration/calendar" to="/dashboard/integration/services" />
+        <Redirect path="/dashboard/integration/weather" to="/dashboard/integration/environment" />
+        <Redirect path="/dashboard/integration/tts" to="/dashboard/integration/assistants" />
+        <Redirect path="/dashboard/integration/music" to="/dashboard/integration" />
+        <Redirect path="/dashboard/integration/health" to="/dashboard/integration" />
+        <Redirect path="/dashboard/integration/navigation" to="/dashboard/integration" />
+
+        <TelegramPage path="/dashboard/integration/communication/telegram" />
+        <Redirect
+          path="/dashboard/integration/communication/nextcloudtalk"
+          to="/dashboard/integration/communication/nextcloud-talk"
+        />
+        <NextcloudTalkPage path="/dashboard/integration/communication/nextcloud-talk" />
+        <Redirect path="/dashboard/integration/calendar/caldav" to="/dashboard/integration/calendar/caldav/account" />
+        <CalDAVAccountPage path="/dashboard/integration/calendar/caldav/account" />
+        <CalDAVSyncPage path="/dashboard/integration/calendar/caldav/sync" />
+        <CalDAVSharePage path="/dashboard/integration/calendar/caldav/share" />
+        <OpenWeatherPage path="/dashboard/integration/weather/openweather" />
+        <Redirect
+          path="/dashboard/integration/device/philips-hue"
+          to="/dashboard/integration/device/philips-hue/device"
+        />
+        <PhilipsHueSetupPage path="/dashboard/integration/device/philips-hue/setup" />
+        <PhilipsHueDevicePage path="/dashboard/integration/device/philips-hue/device" />
+        <Redirect path="/dashboard/integration/device/tp-link" to="/dashboard/integration/device/tp-link/device" />
+        <TPLinkDevicePage path="/dashboard/integration/device/tp-link/device" />
+        <RtspCameraPage path="/dashboard/integration/device/rtsp-camera" />
+        <MqttDevicePage path="/dashboard/integration/device/mqtt" />
+        <MqttDeviceSetupPage path="/dashboard/integration/device/mqtt/edit" />
+        <MqttDeviceSetupPage path="/dashboard/integration/device/mqtt/edit/:deviceSelector" />
+        <MqttSetupPage path="/dashboard/integration/device/mqtt/setup" />
+        <MqttDebugPage path="/dashboard/integration/device/mqtt/debug" />
+        <MqttDiscoveryPage path="/dashboard/integration/device/mqtt/discovery" />
+        <Zigbee2mqttPage path="/dashboard/integration/device/zigbee2mqtt" />
+        <Zigbee2mqttDiscoverPage path="/dashboard/integration/device/zigbee2mqtt/discover" />
+        <Zigbee2mqttSetupPage path="/dashboard/integration/device/zigbee2mqtt/setup" />
+        <Zigbee2mqttEditPage path="/dashboard/integration/device/zigbee2mqtt/edit/:deviceSelector" />
+
+        <NodeRedPage path="/dashboard/integration/device/node-red" />
+
+        <MatterbridgePage path="/dashboard/integration/device/matterbridge" />
+
+        <FreeMobilePage path="dashboard/integration/communication/free-mobile" />
+        <CallMeBotPage path="dashboard/integration/communication/callmebot" />
+        <EnergyMonitoringIntegration path="/dashboard/integration/device/energy-monitoring" />
+        <EnergyMonitoringIntegration path="/dashboard/integration/device/energy-monitoring/contracts" />
+        <EnergyMonitoringIntegration path="/dashboard/integration/device/energy-monitoring/contracts/create" />
+        <EnergyMonitoringIntegration path="/dashboard/integration/device/energy-monitoring/contracts/edit/:selector" />
+        <EnergyMonitoringIntegration path="/dashboard/integration/device/energy-monitoring/prices" />
+        <EnergyMonitoringIntegration path="/dashboard/integration/device/energy-monitoring/settings" />
+
+        <XiaomiPage path="/dashboard/integration/device/xiaomi" />
+        <EditXiaomiPage path="/dashboard/integration/device/xiaomi/edit/:deviceSelector" />
+        <TasmotaPage path="/dashboard/integration/device/tasmota" />
+        <TasmotaEditPage path="/dashboard/integration/device/tasmota/edit/:deviceSelector" />
+        <TasmotaMqttDiscoverPage path="/dashboard/integration/device/tasmota/mqtt" />
+        <TasmotaHttpDiscoverPage path="/dashboard/integration/device/tasmota/http" />
+        <EweLinkPage path="/dashboard/integration/device/ewelink" />
+        <EweLinkEditPage path="/dashboard/integration/device/ewelink/edit/:deviceSelector" />
+        <EweLinkDiscoverPage path="/dashboard/integration/device/ewelink/discover" />
+        <EweLinkSetupPage path="/dashboard/integration/device/ewelink/setup" />
+        <HomeKitPage path="/dashboard/integration/communication/homekit" />
+        <OpenAIPage path="/dashboard/integration/communication/openai" />
+        <MCPPage path="/dashboard/integration/communication/mcp" />
+
+        <TuyaPage path="/dashboard/integration/device/tuya" />
+        <TuyaEditPage path="/dashboard/integration/device/tuya/edit/:deviceSelector" />
+        <TuyaDiscoverPage path="/dashboard/integration/device/tuya/discover" />
+        <TuyaSetupPage path="/dashboard/integration/device/tuya/setup" />
+
+        <NetatmoPage path="/dashboard/integration/device/netatmo" />
+        <NetatmoDiscoverPage path="/dashboard/integration/device/netatmo/discover" />
+        <NetatmoSetupPage path="/dashboard/integration/device/netatmo/setup" />
+
+        <SonosDevicePage path="/dashboard/integration/device/sonos" />
+        <SonosDiscoveryPage path="/dashboard/integration/device/sonos/discover" />
+
+        <GoogleCastDevicePage path="/dashboard/integration/device/google-cast" />
+        <GoogleCastDiscoveryPage path="/dashboard/integration/device/google-cast/discover" />
+
+        <AirplayDevicePage path="/dashboard/integration/device/airplay" />
+        <AirplayDiscoveryPage path="/dashboard/integration/device/airplay/discover" />
+
+        <ZwaveJSUIDevicePage path="/dashboard/integration/device/zwavejs-ui" />
+        <ZwaveJSUIDiscoveryPage path="/dashboard/integration/device/zwavejs-ui/discover" />
+        <ZwaveJSUISetupPage path="/dashboard/integration/device/zwavejs-ui/setup" />
+
+        <MatterDevices path="/dashboard/integration/device/matter" />
+        <MatterDiscoverPage path="/dashboard/integration/device/matter/discover" />
+        <MatterSettingsPage path="/dashboard/integration/device/matter/settings" />
+
+        <MELCloudPage path="/dashboard/integration/device/melcloud" />
+        <MELCloudEditPage path="/dashboard/integration/device/melcloud/edit/:deviceSelector" />
+        <MELCloudDiscoverPage path="/dashboard/integration/device/melcloud/discover" />
+        <MELCloudSetupPage path="/dashboard/integration/device/melcloud/setup" />
+
+        <ThermostatDevicePage path="/dashboard/integration/device/thermostat" />
+        <ThermostatSchedulePage path="/dashboard/integration/device/thermostat/schedule" />
+        <ThermostatEditPage path="/dashboard/integration/device/thermostat/new" />
+        <ThermostatEditPage path="/dashboard/integration/device/thermostat/edit/:deviceSelector" />
+
+        <NukiPage path="/dashboard/integration/device/nuki" />
+        <NukiSetupPage path="/dashboard/integration/device/nuki/setup" />
+        <NukiMqttDiscoverPage path="/dashboard/integration/device/nuki/mqtt" />
+        <NukiHttpDiscoverPage path="/dashboard/integration/device/nuki/http" />
+
+        <BluetoothDevicePage path="/dashboard/integration/device/bluetooth" />
+        <BluetoothEditDevicePage path="/dashboard/integration/device/bluetooth/:deviceSelector" />
+        <BluetoothSetupPage path="/dashboard/integration/device/bluetooth/setup" />
+        <BluetoothSetupPeripheralPage path="/dashboard/integration/device/bluetooth/setup/:uuid" />
+        <BluetoothSettingsPage path="/dashboard/integration/device/bluetooth/config" />
+
+        <BroadlinkDevicePage path="/dashboard/integration/device/broadlink" />
+        <BroadlinkRemoteSetupPage path="/dashboard/integration/device/broadlink/edit" />
+        <BroadlinkRemoteSetupPage path="/dashboard/integration/device/broadlink/edit/:deviceSelector" />
+        <BroadlinkPeripheralPage path="/dashboard/integration/device/broadlink/peripheral" />
+
+        <LANManagerDevicePage path="/dashboard/integration/device/lan-manager" />
+        <LANManagerDiscoverPage path="/dashboard/integration/device/lan-manager/discover" />
+        <LANManagerSettingsPage path="/dashboard/integration/device/lan-manager/config" />
+
+        <ExternalIntegrationDevicePage path="/dashboard/integration/device/external/:selector" />
+        <ExternalIntegrationDiscoverPage path="/dashboard/integration/device/external/:selector/discover" />
+        <ExternalIntegrationConfigPage path="/dashboard/integration/device/external/:selector/config" />
+        <ExternalIntegrationSupervisionPage path="/dashboard/integration/device/external/:selector/supervision" />
+        <ExternalIntegrationLogsPage path="/dashboard/integration/device/external/:selector/logs" />
+        <ExternalIntegrationInstallPage path="/dashboard/integration/device/external-install/:owner/:repo" />
+        <ExternalIntegrationOAuthCallbackPage path="/dashboard/integration/device/external/:selector/oauth-callback" />
+
+        <GoogleHomeWelcomePage path="/dashboard/integration/communication/googlehome" />
+        <GoogleHomeGateway path="/dashboard/integration/device/google-home/authorize" />
+        <AlexaWelcomePage path="/dashboard/integration/communication/alexa" />
+        <AlexaGateway path="/dashboard/integration/device/alexa/authorize" />
+        <OwntracksWelcomePage path="/dashboard/integration/device/owntracks" />
+        <EnedisGateway path="/dashboard/integration/device/enedis" />
+        <EnedisGatewayUsagePoints path="/dashboard/integration/device/enedis/usage-points" />
+        <EnedisGateway path="/dashboard/integration/device/enedis/redirect" />
+
+        <SafeAsyncRoute path="/dashboard/devices" component={DevicesListPage} />
+        <SafeAsyncRoute path="/dashboard/history" component={HistoryPage} />
+        <SafeAsyncRoute path="/dashboard/chat" component={ChatPage} />
+        <SafeAsyncRoute path="/dashboard/maps" component={MapPage} />
+        <MapNewAreaPage path="/dashboard/maps/area/new" />
+        <MapNewAreaPage path="/dashboard/maps/area/edit/:areaSelector" />
+        <SafeAsyncRoute path="/dashboard/calendar" component={CalendarPage} />
+        <SafeAsyncRoute path="/dashboard/scene" component={ScenePage} />
+        <NewScenePage path="/dashboard/scene/new" />
+        <DuplicateScenePage path="/dashboard/scene/:scene_selector/duplicate" />
+        <EditScenePage path="/dashboard/scene/:scene_selector" />
+        <SafeAsyncRoute path="/dashboard/profile" component={ProfilePage} />
+        <SettingsSessionPage path="/dashboard/settings/session" />
+        <SafeAsyncRoute path="/dashboard/settings/house" component={SettingsHousePage} />
+        <SettingsUserPage path="/dashboard/settings/user" />
+        <SettingsEditUserPage path="/dashboard/settings/user/edit/:user_selector" />
+        <SettingsCreateUserPage path="/dashboard/settings/user/new" />
+        <SettingsSystemPage path="/dashboard/settings/system" />
+        <SettingsGateway path="/dashboard/settings/gateway" />
+        <SettingsServicePage path="/dashboard/settings/service" />
+        <SettingsBackup path="/dashboard/settings/backup" />
+        <SettingsBackgroundJobs path="/dashboard/settings/jobs" />
+        <Error type="404" default />
+      </Router>
+    </Layout>
+  </div>
+));
+
+class MainApp extends Component {
+  componentWillMount() {
+    this.props.checkSession();
+  }
+
+  componentDidMount() {
+    // Listen for system preference change
+    const prefersDarkMode = window.matchMedia('(prefers-color-scheme: dark)');
+    prefersDarkMode.addEventListener('change', this.handleSystemPreferenceChange);
+    // Gladys never pushes the "update available" flag: it is recomputed when
+    // the server refreshes the store index, so a long-opened tab only learns
+    // about a new version by asking again at the same cadence
+    this.externalIntegrationUpdatesInterval = setInterval(
+      this.props.refreshExternalIntegrationsToUpdate,
+      EXTERNAL_INTEGRATION_UPDATES_REFRESH_INTERVAL_MS
+    );
+  }
+
+  componentWillUnmount() {
+    // Remove event listener to prevent memory leaks
+    window.matchMedia('(prefers-color-scheme: dark)').removeEventListener('change', this.handleSystemPreferenceChange);
+    clearInterval(this.externalIntegrationUpdatesInterval);
+  }
+
+  handleSystemPreferenceChange = () => {
+    // Use the global action to update dark mode state based on system preference
+    this.props.updateDarkModeFromSystem();
+  };
+
+  render({ user }, {}) {
+    const translationDefinition = get(translations, user.language, { default: translations.en });
+    return (
+      <IntlProvider definition={translationDefinition}>
+        <AppRouter />
+      </IntlProvider>
+    );
+  }
+}
+
+const MainAppConnected = connect('user', actions)(MainApp);
+
+const App = () => (
+  <Provider store={store}>
+    <MainAppConnected />
+  </Provider>
+);
+
+export default App;

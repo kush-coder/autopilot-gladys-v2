@@ -1,0 +1,374 @@
+const sinon = require('sinon').createSandbox();
+
+const { fake, assert, useFakeTimers } = sinon;
+const { expect } = require('chai');
+const EventEmitter = require('events');
+
+const EnergyMonitoring = require('../../../services/energy-monitoring/lib');
+const { SYSTEM_VARIABLE_NAMES } = require('../../../utils/constants');
+const Device = require('../../../lib/device');
+const StateManager = require('../../../lib/state');
+const ServiceManager = require('../../../lib/service');
+const Job = require('../../../lib/job');
+
+const event = new EventEmitter();
+const job = new Job(event);
+
+const brain = {
+  addNamedEntity: fake.returns(null),
+  removeNamedEntity: fake.returns(null),
+};
+
+const variable = {
+  getValue: (name) => {
+    if (name === SYSTEM_VARIABLE_NAMES.TIMEZONE) {
+      return 'Europe/Paris';
+    }
+    return null;
+  },
+};
+
+describe('EnergyMonitoring.init', () => {
+  let stateManager;
+  let serviceManager;
+  let device;
+  let gladys;
+  let energyMonitoring;
+  let mockScheduler;
+
+  beforeEach(async () => {
+    stateManager = new StateManager(event);
+    serviceManager = new ServiceManager({}, stateManager);
+    device = new Device(event, {}, stateManager, serviceManager, {}, variable, job, brain);
+
+    // Mock scheduler
+    mockScheduler = {
+      scheduleJob: fake.returns('mock-job-id'),
+    };
+
+    gladys = {
+      variable,
+      device,
+      energyContract: {
+        checkPriceChanges: fake.resolves([]),
+      },
+      event: { on: fake.returns(null) },
+      scheduler: mockScheduler,
+      job: {
+        updateProgress: fake.returns(null),
+        wrapper: (name, func) => func,
+      },
+    };
+
+    energyMonitoring = new EnergyMonitoring(gladys, 'a810b8db-6d04-4697-bed3-c4b72c996279');
+  });
+
+  it('should schedule combined energy monitoring job on first init', async () => {
+    await energyMonitoring.init();
+
+    // Verify the jobs are scheduled (30 min job + billing period job + two 24h jobs + 15 min price check)
+    expect(mockScheduler.scheduleJob.callCount).to.equal(5);
+
+    // Verify combined job (at 00:00 and 00:30)
+    const jobCall = mockScheduler.scheduleJob.getCall(0);
+    expect(jobCall.args[0]).to.equal('0 0,30 * * * *');
+    expect(typeof jobCall.args[1]).to.equal('function');
+
+    // Verify the billing period job runs at 02:00 in the system timezone
+    const billingPeriodJobCall = mockScheduler.scheduleJob.getCall(1);
+    expect(billingPeriodJobCall.args[0]).to.have.property('hour', 2);
+    expect(billingPeriodJobCall.args[0]).to.have.property('tz', 'Europe/Paris');
+
+    // Verify 24h job uses RecurrenceRule with timezone
+    const dailyJobCall = mockScheduler.scheduleJob.getCall(2);
+    const rule = dailyJobCall.args[0];
+    expect(rule).to.have.property('recurs', true);
+    expect(rule).to.have.property('hour', 11);
+    expect(rule).to.have.property('minute', 10);
+    expect(rule).to.have.property('tz', 'Europe/Paris');
+    expect(typeof dailyJobCall.args[1]).to.equal('function');
+
+    // Verify 24h job uses RecurrenceRule with timezone
+    const lastDailyJobCall = mockScheduler.scheduleJob.getCall(3);
+    const rule2 = lastDailyJobCall.args[0];
+    expect(rule2).to.have.property('recurs', true);
+    expect(rule2).to.have.property('hour', 16);
+    expect(rule2).to.have.property('minute', 10);
+    expect(rule2).to.have.property('tz', 'Europe/Paris');
+    expect(typeof lastDailyJobCall.args[1]).to.equal('function');
+
+    // Verify the price check of the 15-minute calendars runs at :15 and :45
+    const quarterJobCall = mockScheduler.scheduleJob.getCall(4);
+    expect(quarterJobCall.args[0]).to.equal('0 15,45 * * * *');
+    expect(typeof quarterJobCall.args[1]).to.equal('function');
+
+    // Verify job IDs are stored
+    expect(energyMonitoring.calculateConsumptionAndCostEvery30MinutesJob).to.equal('mock-job-id');
+    expect(energyMonitoring.calculateConsumptionAndCostEvery24HoursJob).to.equal('mock-job-id');
+  });
+
+  it('should not schedule job again if already scheduled', async () => {
+    // Set existing job IDs
+    energyMonitoring.calculateConsumptionAndCostEvery30MinutesJob = 'existing-job';
+    energyMonitoring.calculateConsumptionAndCostEvery24HoursJob = 'existing-daily-job';
+    energyMonitoring.calculateConsumptionAndCostEvery24HoursLastJob = 'existing-last-daily-job';
+    energyMonitoring.closeBillingPeriodsJob = 'existing-billing-period-job';
+    energyMonitoring.checkPriceChangesEveryFifteenMinutesJob = 'existing-quarter-hour-job';
+
+    await energyMonitoring.init();
+
+    // Verify no new job is scheduled
+    assert.notCalled(mockScheduler.scheduleJob);
+
+    // Verify existing job IDs are preserved
+    expect(energyMonitoring.calculateConsumptionAndCostEvery30MinutesJob).to.equal('existing-job');
+    expect(energyMonitoring.calculateConsumptionAndCostEvery24HoursJob).to.equal('existing-daily-job');
+    expect(energyMonitoring.calculateConsumptionAndCostEvery24HoursLastJob).to.equal('existing-last-daily-job');
+  });
+
+  it('should schedule job if not already scheduled', async () => {
+    // No existing jobs
+    energyMonitoring.calculateConsumptionAndCostEvery30MinutesJob = null;
+    energyMonitoring.calculateConsumptionAndCostEvery24HoursJob = null;
+
+    await energyMonitoring.init();
+
+    // Verify all jobs are scheduled
+    expect(mockScheduler.scheduleJob.callCount).to.equal(5);
+
+    const jobCall = mockScheduler.scheduleJob.getCall(0);
+    expect(jobCall.args[0]).to.equal('0 0,30 * * * *');
+
+    // Verify job IDs are set
+    expect(energyMonitoring.calculateConsumptionAndCostEvery30MinutesJob).to.equal('mock-job-id');
+    expect(energyMonitoring.calculateConsumptionAndCostEvery24HoursJob).to.equal('mock-job-id');
+  });
+
+  describe('Scheduled job execution', () => {
+    let calculateCostEveryThirtyMinutes;
+    let calculateConsumptionFromIndexThirtyMinutes;
+    let calculateProductionFromIndexThirtyMinutes;
+    let calculateCostFromYesterday;
+
+    beforeEach(() => {
+      calculateCostEveryThirtyMinutes = fake.returns(null);
+      calculateConsumptionFromIndexThirtyMinutes = fake.returns(null);
+      calculateProductionFromIndexThirtyMinutes = fake.returns(null);
+      calculateCostFromYesterday = fake.returns(null);
+
+      energyMonitoring.delegatedCatchUp = fake.returns(null);
+      energyMonitoring.calculateCostEveryThirtyMinutes = calculateCostEveryThirtyMinutes;
+      energyMonitoring.calculateConsumptionFromIndexThirtyMinutes = calculateConsumptionFromIndexThirtyMinutes;
+      energyMonitoring.calculateProductionFromIndexThirtyMinutes = calculateProductionFromIndexThirtyMinutes;
+      energyMonitoring.calculateCostFromYesterday = calculateCostFromYesterday;
+    });
+
+    it('should execute both consumption and cost calculation when job runs', async () => {
+      await energyMonitoring.init();
+
+      // Get the combined job function
+      const jobFunction = mockScheduler.scheduleJob.getCall(0).args[1];
+
+      // Execute the job
+      await jobFunction();
+
+      // Verify all calculations were called
+      assert.calledOnce(calculateConsumptionFromIndexThirtyMinutes);
+      assert.calledOnce(calculateProductionFromIndexThirtyMinutes);
+      assert.calledOnce(calculateCostEveryThirtyMinutes);
+      assert.calledOnce(gladys.energyContract.checkPriceChanges);
+    });
+
+    it('should not fail the job when the price change check fails', async () => {
+      gladys.energyContract.checkPriceChanges = fake.rejects(new Error('boom'));
+      await energyMonitoring.init();
+      const jobFunction = mockScheduler.scheduleJob.getCall(0).args[1];
+      await jobFunction();
+      assert.calledOnce(calculateCostEveryThirtyMinutes);
+      assert.calledOnce(gladys.energyContract.checkPriceChanges);
+    });
+
+    it('should check the price changes of the contracts reading a 15-minute calendar at :15 and :45', async () => {
+      await energyMonitoring.init();
+      const quarterJobFunction = mockScheduler.scheduleJob.getCall(4).args[1];
+      await quarterJobFunction();
+      assert.calledOnceWithExactly(gladys.energyContract.checkPriceChanges, {
+        calendar_granularity: 'fifteen_minutes',
+      });
+      // the cost calculation stays in the 30-minute job
+      assert.notCalled(calculateCostEveryThirtyMinutes);
+      assert.notCalled(calculateConsumptionFromIndexThirtyMinutes);
+    });
+
+    it('should not fail the quarter-hour job when the price change check fails', async () => {
+      gladys.energyContract.checkPriceChanges = fake.rejects(new Error('boom'));
+      await energyMonitoring.init();
+      const quarterJobFunction = mockScheduler.scheduleJob.getCall(4).args[1];
+      await quarterJobFunction();
+      assert.calledOnce(gladys.energyContract.checkPriceChanges);
+    });
+
+    it('should pass current time to both calculation functions', async () => {
+      await energyMonitoring.init();
+
+      // Get the combined job function
+      const jobFunction = mockScheduler.scheduleJob.getCall(0).args[1];
+
+      // Execute the job (it will use current time)
+      await jobFunction();
+
+      // Verify all calculations were called
+      assert.calledOnce(calculateConsumptionFromIndexThirtyMinutes);
+      assert.calledOnce(calculateProductionFromIndexThirtyMinutes);
+      assert.calledOnce(calculateCostEveryThirtyMinutes);
+
+      // Verify all functions receive the now timestamp
+      const consumptionCallArgs = calculateConsumptionFromIndexThirtyMinutes.getCall(0).args;
+      const productionCallArgs = calculateProductionFromIndexThirtyMinutes.getCall(0).args;
+      const costCallArgs = calculateCostEveryThirtyMinutes.getCall(0).args;
+
+      expect(consumptionCallArgs[0]).to.be.instanceOf(Date);
+      expect(productionCallArgs[0]).to.be.instanceOf(Date);
+      expect(costCallArgs[0]).to.be.instanceOf(Date);
+    });
+
+    it('should create current timestamp when job executes', async () => {
+      await energyMonitoring.init();
+
+      // Get the combined job function
+      const jobFunction = mockScheduler.scheduleJob.getCall(0).args[1];
+
+      // Execute the job
+      await jobFunction();
+
+      // Verify consumption calculation was called
+      assert.calledOnce(calculateConsumptionFromIndexThirtyMinutes);
+
+      const callArgs = calculateConsumptionFromIndexThirtyMinutes.getCall(0).args;
+      expect(callArgs[0]).to.be.instanceOf(Date);
+    });
+
+    it('should pass mocked time when using fake timers (before 30 minutes)', async () => {
+      // Use sinon fake timers to mock a time with minutes < 30 (e.g., 10:15:45.123)
+      const clock = useFakeTimers(new Date('2023-10-15T10:15:45.123Z'));
+
+      try {
+        await energyMonitoring.init();
+
+        // Get the combined job function
+        const jobFunction = mockScheduler.scheduleJob.getCall(0).args[1];
+
+        // Execute the job
+        await jobFunction();
+
+        // Verify consumption calculation was called
+        assert.calledOnce(calculateConsumptionFromIndexThirtyMinutes);
+
+        const callArgs = calculateConsumptionFromIndexThirtyMinutes.getCall(0).args;
+        const timestamp = callArgs[0];
+
+        // Should receive the mocked time
+        expect(timestamp.getMinutes()).to.equal(15);
+        expect(timestamp.getSeconds()).to.equal(45);
+        expect(timestamp.getMilliseconds()).to.equal(123);
+      } finally {
+        clock.restore();
+      }
+    });
+
+    it('should pass mocked time when using fake timers (after 30 minutes)', async () => {
+      // Use sinon fake timers to mock a time with minutes >= 30 (e.g., 10:45:30.456)
+      const clock = useFakeTimers(new Date('2023-10-15T10:45:30.456Z'));
+
+      try {
+        await energyMonitoring.init();
+
+        // Get the combined job function
+        const jobFunction = mockScheduler.scheduleJob.getCall(0).args[1];
+
+        // Execute the job
+        await jobFunction();
+
+        // Verify consumption calculation was called
+        assert.calledOnce(calculateConsumptionFromIndexThirtyMinutes);
+
+        const callArgs = calculateConsumptionFromIndexThirtyMinutes.getCall(0).args;
+        const timestamp = callArgs[0];
+
+        // Should receive the mocked time
+        expect(timestamp.getMinutes()).to.equal(45);
+        expect(timestamp.getSeconds()).to.equal(30);
+        expect(timestamp.getMilliseconds()).to.equal(456);
+      } finally {
+        clock.restore();
+      }
+    });
+
+    it('should execute calculateCostFromYesterday with yesterday at midnight when daily job runs', async () => {
+      // Use sinon fake timers to mock a specific time
+      const clock = useFakeTimers(new Date('2023-10-15T09:00:00.000Z'));
+
+      try {
+        await energyMonitoring.init();
+
+        // Get the daily job function (third call, after the 30-minute and billing period jobs)
+        const dailyJobFunction = mockScheduler.scheduleJob.getCall(2).args[1];
+
+        // Execute the daily job
+        await dailyJobFunction();
+
+        // Verify calculateCostFromYesterday was called
+        assert.calledOnce(calculateCostFromYesterday);
+
+        const callArgs = calculateCostFromYesterday.getCall(0).args;
+        const yesterdayDate = callArgs[0];
+
+        // Should be yesterday at midnight in Europe/Paris timezone
+        expect(yesterdayDate).to.be.instanceOf(Date);
+        // October 14, 2023 at midnight in Europe/Paris (CEST = UTC+2)
+        // So midnight Paris = 22:00 UTC on Oct 13
+        expect(yesterdayDate.getUTCFullYear()).to.equal(2023);
+        expect(yesterdayDate.getUTCMonth()).to.equal(9); // October (0-indexed)
+        expect(yesterdayDate.getUTCDate()).to.equal(13);
+        expect(yesterdayDate.getUTCHours()).to.equal(22); // Midnight Paris = 22:00 UTC (CEST)
+        expect(yesterdayDate.getUTCMinutes()).to.equal(0);
+        expect(yesterdayDate.getUTCSeconds()).to.equal(0);
+      } finally {
+        clock.restore();
+      }
+    });
+    it('should execute calculateCostFromYesterday with yesterday at midnight when 16:10 daily job runs', async () => {
+      // Use sinon fake timers to mock a specific time
+      const clock = useFakeTimers(new Date('2023-10-15T09:00:00.000Z'));
+
+      try {
+        await energyMonitoring.init();
+
+        // Get the 16:10 daily job function (fourth call)
+        const dailyJobFunction = mockScheduler.scheduleJob.getCall(3).args[1];
+
+        // Execute the daily job
+        await dailyJobFunction();
+
+        // Verify calculateCostFromYesterday was called
+        assert.calledOnce(calculateCostFromYesterday);
+
+        const callArgs = calculateCostFromYesterday.getCall(0).args;
+        const yesterdayDate = callArgs[0];
+
+        // Should be yesterday at midnight in Europe/Paris timezone
+        expect(yesterdayDate).to.be.instanceOf(Date);
+        // October 14, 2023 at midnight in Europe/Paris (CEST = UTC+2)
+        // So midnight Paris = 22:00 UTC on Oct 13
+        expect(yesterdayDate.getUTCFullYear()).to.equal(2023);
+        expect(yesterdayDate.getUTCMonth()).to.equal(9); // October (0-indexed)
+        expect(yesterdayDate.getUTCDate()).to.equal(13);
+        expect(yesterdayDate.getUTCHours()).to.equal(22); // Midnight Paris = 22:00 UTC (CEST)
+        expect(yesterdayDate.getUTCMinutes()).to.equal(0);
+        expect(yesterdayDate.getUTCSeconds()).to.equal(0);
+      } finally {
+        clock.restore();
+      }
+    });
+  });
+});

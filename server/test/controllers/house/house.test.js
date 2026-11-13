@@ -1,0 +1,276 @@
+const { expect } = require('chai');
+const { authenticatedRequest, nonAdminRequest, NON_ADMIN_USER_ID } = require('../request.test');
+const db = require('../../../models');
+const { USER_ROLE } = require('../../../utils/constants');
+
+describe('POST /api/v1/house', () => {
+  it('should create house', async () => {
+    await authenticatedRequest
+      .post('/api/v1/house')
+      .send({
+        name: 'my house',
+      })
+      .expect('Content-Type', /json/)
+      .expect(201)
+      .then((res) => {
+        expect(res.body).to.have.property('name', 'my house');
+        expect(res.body).to.have.property('selector', 'my-house');
+      });
+  });
+});
+
+describe('GET /api/v1/house', () => {
+  it('should return list of houses', async () => {
+    await authenticatedRequest
+      .get('/api/v1/house')
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.deep.equal([
+          {
+            id: '6295ad8b-b655-4422-9e6d-b4612da5d55f',
+            name: 'Peppers house',
+            selector: 'pepper-house',
+            alarm_code: null,
+            alarm_delay_before_arming: 10,
+            alarm_mode: 'disarmed',
+            latitude: null,
+            longitude: null,
+            created_at: '2019-02-12T07:49:07.556Z',
+            updated_at: '2019-02-12T07:49:07.556Z',
+          },
+          {
+            id: 'a741dfa6-24de-4b46-afc7-370772f068d5',
+            name: 'Test house',
+            selector: 'test-house',
+            alarm_code: null,
+            alarm_delay_before_arming: 10,
+            alarm_mode: 'disarmed',
+            latitude: 12,
+            longitude: 12,
+            created_at: '2019-02-12T07:49:07.556Z',
+            updated_at: '2019-02-12T07:49:07.556Z',
+          },
+        ]);
+      });
+  });
+  it('should return list of houses in desc order', async () => {
+    await authenticatedRequest
+      .get('/api/v1/house')
+      .query({
+        order_dir: 'desc',
+      })
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.deep.equal([
+          {
+            id: 'a741dfa6-24de-4b46-afc7-370772f068d5',
+            name: 'Test house',
+            selector: 'test-house',
+            alarm_code: null,
+            alarm_delay_before_arming: 10,
+            alarm_mode: 'disarmed',
+            latitude: 12,
+            longitude: 12,
+            created_at: '2019-02-12T07:49:07.556Z',
+            updated_at: '2019-02-12T07:49:07.556Z',
+          },
+          {
+            id: '6295ad8b-b655-4422-9e6d-b4612da5d55f',
+            name: 'Peppers house',
+            selector: 'pepper-house',
+            alarm_code: null,
+            alarm_delay_before_arming: 10,
+            alarm_mode: 'disarmed',
+            latitude: null,
+            longitude: null,
+            created_at: '2019-02-12T07:49:07.556Z',
+            updated_at: '2019-02-12T07:49:07.556Z',
+          },
+        ]);
+      });
+  });
+  it('should search and return only one house', async () => {
+    await authenticatedRequest
+      .get('/api/v1/house')
+      .query({
+        search: 'test',
+      })
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.deep.equal([
+          {
+            id: 'a741dfa6-24de-4b46-afc7-370772f068d5',
+            name: 'Test house',
+            selector: 'test-house',
+            alarm_code: null,
+            alarm_delay_before_arming: 10,
+            alarm_mode: 'disarmed',
+            latitude: 12,
+            longitude: 12,
+            created_at: '2019-02-12T07:49:07.556Z',
+            updated_at: '2019-02-12T07:49:07.556Z',
+          },
+        ]);
+      });
+  });
+});
+
+describe('PATCH /api/v1/house/test-house', () => {
+  it('should update a house', async () => {
+    await authenticatedRequest
+      .patch('/api/v1/house/test-house')
+      .send({
+        name: 'NEW NAME',
+      })
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.have.property('name', 'NEW NAME');
+      });
+  });
+});
+
+describe('GET /api/v1/house/test-house', () => {
+  it('should get a house by selector', async () => {
+    await authenticatedRequest
+      .get('/api/v1/house/test-house')
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.have.property('selector', 'test-house');
+        expect(res.body).to.have.property('alarm_mode', 'disarmed');
+      });
+  });
+});
+
+describe('DELETE /api/v1/house/test-house', () => {
+  it('should delete a house', async () => {
+    await authenticatedRequest
+      .delete('/api/v1/house/test-house')
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.have.property('success', true);
+      });
+  });
+});
+
+describe('GET /api/v1/house/test-house/room', () => {
+  it('should return rooms in a house', async () => {
+    await authenticatedRequest
+      .get('/api/v1/house/test-house/room')
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        res.body.forEach((room) => {
+          expect(room).to.have.property('id');
+          expect(room).to.have.property('name');
+        });
+      });
+  });
+});
+
+describe('POST /api/v1/house/:user_selector/user/:user_selector/seen', () => {
+  it('should mark the user has seen in this house', async () => {
+    await authenticatedRequest
+      .post('/api/v1/house/test-house/user/john/seen')
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.have.property('current_house_id', 'a741dfa6-24de-4b46-afc7-370772f068d5');
+      });
+  });
+
+  // Marking a user as seen changes their presence and can start presence
+  // scenes: a non-admin user can only do it for themselves, while an admin can
+  // still do it for the whole household.
+  describe('access control', () => {
+    beforeEach(async () => {
+      await db.User.create({
+        id: NON_ADMIN_USER_ID,
+        firstname: 'Pepper',
+        lastname: 'Potts',
+        selector: 'pepper-habitant',
+        email: 'pepper-habitant@pots.com',
+        password: 'mysuperpassword',
+        role: USER_ROLE.HABITANT,
+        language: 'en',
+        birthdate: '1990-12-12',
+      });
+    });
+
+    it('should let a non-admin mark themselves as seen', async () => {
+      await nonAdminRequest
+        .post('/api/v1/house/test-house/user/pepper-habitant/seen')
+        .expect('Content-Type', /json/)
+        .expect(200)
+        .then((res) => {
+          expect(res.body).to.have.property('current_house_id', 'a741dfa6-24de-4b46-afc7-370772f068d5');
+        });
+    });
+
+    it('should not let a non-admin mark another user as seen', async () => {
+      const johnBefore = await db.User.findOne({ where: { selector: 'john' } });
+      await nonAdminRequest
+        .post('/api/v1/house/test-house/user/john/seen')
+        .expect('Content-Type', /json/)
+        .expect(403);
+      const johnAfter = await db.User.findOne({ where: { selector: 'john' } });
+      expect(johnAfter.current_house_id).to.equal(johnBefore.current_house_id);
+    });
+
+    it('should let an admin mark another user as seen', async () => {
+      await authenticatedRequest
+        .post('/api/v1/house/test-house/user/pepper-habitant/seen')
+        .expect('Content-Type', /json/)
+        .expect(200)
+        .then((res) => {
+          expect(res.body).to.have.property('current_house_id', 'a741dfa6-24de-4b46-afc7-370772f068d5');
+        });
+    });
+  });
+});
+
+describe('GET /api/v1/house/:house_selector/sun', () => {
+  it('should return the sun state of the house', async () => {
+    await authenticatedRequest
+      .get('/api/v1/house/test-house/sun')
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.have.property('dawn');
+        expect(res.body).to.have.property('sunrise');
+        expect(res.body).to.have.property('solar_noon');
+        expect(res.body).to.have.property('sunset');
+        expect(res.body).to.have.property('dusk');
+        expect(res.body.azimuth).to.be.a('number');
+        expect(res.body.elevation).to.be.a('number');
+        expect(res.body.curve).to.be.an('array');
+        // One point every 20 minutes from local midnight to the next one included. The
+        // request runs on today, so the day lasts 23 or 25 hours when the clocks change:
+        // 73 points then became 70 or 76, and the test failed twice a year.
+        const { curve } = res.body;
+        const dayLength = new Date(curve[curve.length - 1].time).getTime() - new Date(curve[0].time).getTime();
+        expect([23, 24, 25].map((hours) => hours * 60 * 60 * 1000)).to.include(dayLength);
+        expect(curve).to.have.lengthOf(dayLength / (20 * 60 * 1000) + 1);
+        curve.slice(1).forEach((point, index) => {
+          expect(new Date(point.time).getTime() - new Date(curve[index].time).getTime()).to.equal(20 * 60 * 1000);
+        });
+      });
+  });
+  it('should return 400 when the house has no coordinates', async () => {
+    await authenticatedRequest
+      .get('/api/v1/house/pepper-house/sun')
+      .expect('Content-Type', /json/)
+      .expect(400);
+  });
+  it('should return 404 when the house does not exist', async () => {
+    await authenticatedRequest
+      .get('/api/v1/house/house-does-not-exist/sun')
+      .expect('Content-Type', /json/)
+      .expect(404);
+  });
+});

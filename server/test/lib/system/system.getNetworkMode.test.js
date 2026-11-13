@@ -1,0 +1,85 @@
+const { expect } = require('chai');
+const sinon = require('sinon').createSandbox();
+
+const { fake, assert } = sinon;
+
+const proxyquire = require('proxyquire').noCallThru();
+
+const { PlatformNotCompatible } = require('../../../utils/coreErrors');
+const DockerodeMock = require('./DockerodeMock.test');
+
+const System = proxyquire('../../../lib/system', {
+  dockerode: DockerodeMock,
+  './system.getGladysContainerId': {
+    getGladysContainerId: fake.resolves('967ef3114fa2ceb8c4f6dbdbc78ee411a6f33fb1fe1d32455686ef6e89f41d1c'),
+  },
+});
+const Job = require('../../../lib/job');
+
+const sequelize = {
+  close: fake.resolves(null),
+};
+
+const event = {
+  on: fake.resolves(null),
+  emit: fake.resolves(null),
+};
+
+const job = new Job(event);
+
+const config = {
+  tempFolder: process.env.TEMP_FOLDER || '/tmp/gladys',
+};
+
+describe('system.getNetworkMode', () => {
+  let system;
+
+  beforeEach(async () => {
+    system = new System(sequelize, event, config, job);
+    await system.init();
+    // Reset all fakes invoked within init call (the Dockerode mock fakes live
+    // in the mock file's own sandbox, hence the dedicated reset)
+    sinon.reset();
+    DockerodeMock.resetMockHistory();
+  });
+
+  afterEach(() => {
+    sinon.reset();
+  });
+
+  it('should failed as not on docker env', async () => {
+    system.dockerode = undefined;
+
+    try {
+      await system.getNetworkMode();
+      assert.fail('should have fail');
+    } catch (e) {
+      expect(e).be.instanceOf(PlatformNotCompatible);
+    }
+  });
+
+  it('should check network', async () => {
+    const network = await system.getNetworkMode();
+    expect(network).to.eq('host');
+    assert.calledOnce(system.dockerode.getContainer);
+  });
+
+  it('should return host-process mode when Gladys is not containerized', async () => {
+    system.networkMode = null;
+    system.getGladysContainerId = fake.rejects(new PlatformNotCompatible('DOCKER_CONTAINER_ID_NOT_AVAILABLE'));
+    const network = await system.getNetworkMode();
+    expect(network).to.eq('host-process');
+    assert.notCalled(system.dockerode.getContainer);
+  });
+
+  it('should rethrow unexpected errors of getGladysContainerId', async () => {
+    system.networkMode = null;
+    system.getGladysContainerId = fake.rejects(new Error('UNEXPECTED'));
+    try {
+      await system.getNetworkMode();
+      assert.fail('should have fail');
+    } catch (e) {
+      expect(e.message).to.eq('UNEXPECTED');
+    }
+  });
+});

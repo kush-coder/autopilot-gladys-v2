@@ -1,0 +1,59 @@
+const sinon = require('sinon').createSandbox();
+const { expect } = require('chai');
+// No .noPreserveCache(): it would evict the stubbed dependencies from
+// require.cache after each call, handing every module loaded later a second
+// copy of them (see tuya.setValue.test.js for the failure this causes).
+const proxyquire = require('proxyquire').noCallThru();
+
+const { loadFixtureCases } = require('../fixtures/fixtureHelper');
+
+describe('TuyaHandler.setValue fixtures', () => {
+  const fixtureCases = loadFixtureCases('setValueLocal');
+
+  fixtureCases.forEach((fixtureCase) => {
+    it(`should set local value for ${fixtureCase.manifest.name} from fixture`, async () => {
+      const connect = sinon.stub().resolves();
+      const set = sinon.stub().resolves();
+      const disconnect = sinon.stub().resolves();
+
+      /**
+       * @description Simple TuyAPI test double used for fixture-driven local setValue tests.
+       * @example
+       * new TuyAPIStub();
+       */
+      function TuyAPIStub() {
+        this.connect = connect;
+        this.set = set;
+        this.disconnect = disconnect;
+      }
+
+      const { setValue } = proxyquire('../../../../services/tuya/lib/tuya.setValue', {
+        tuyapi: TuyAPIStub,
+        '@demirdeniz/tuyapi-newgen': function TuyAPINewGenStub() {},
+      });
+
+      const {
+        device,
+        featureExternalId,
+        inputValue,
+        expectedLocalSet,
+        expectedCloudRequests = 0,
+      } = fixtureCase.manifest.setValueLocal;
+
+      const currentDevice = fixtureCase.load(device);
+      const currentFeature = currentDevice.features.find((feature) => feature.external_id === featureExternalId);
+      const ctx = {
+        connector: { request: sinon.stub().resolves({}) },
+        gladys: {},
+      };
+
+      await setValue.call(ctx, currentDevice, currentFeature, inputValue);
+
+      expect(connect.calledOnce).to.equal(true);
+      expect(set.calledOnce).to.equal(true);
+      expect(disconnect.calledOnce).to.equal(true);
+      expect(set.firstCall.args[0]).to.deep.equal(expectedLocalSet);
+      expect(ctx.connector.request.callCount).to.equal(expectedCloudRequests);
+    });
+  });
+});

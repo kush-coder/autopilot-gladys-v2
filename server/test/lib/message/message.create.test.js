@@ -1,0 +1,184 @@
+const { expect } = require('chai');
+const sinon = require('sinon').createSandbox();
+
+const { fake, assert } = sinon;
+const { Op } = require('sequelize');
+const db = require('../../../models');
+const MessageHandler = require('../../../lib/message');
+
+const brain = {
+  getReply: () => 'Gladys Plus required',
+};
+const service = {
+  getService: () => null,
+};
+const userId = '0cd30aef-9c4e-4a23-88e3-3547971296e5';
+
+describe('message.create', () => {
+  beforeEach(async () => {
+    await db.Message.destroy({
+      where: {
+        [Op.or]: [{ sender_id: userId }, { receiver_id: userId }],
+      },
+    });
+  });
+
+  it('should reply with Gladys Plus required when gateway is not configured', async () => {
+    const variable = {
+      getValue: fake.resolves(null),
+    };
+    const event = {
+      on: fake.returns(null),
+      emit: fake.returns(null),
+    };
+    const messageHandler = new MessageHandler(event, brain, service, {}, variable);
+    const message = {
+      text: 'Turn on the light in the kitchen',
+      language: 'en',
+      source: 'client-api',
+      source_user_id: userId,
+      user: {
+        id: userId,
+        language: 'en',
+      },
+      id: '5cd30aef-9c4e-4a23-88e3-3547971296e5',
+    };
+    const newMessage = await messageHandler.create(message);
+    expect(newMessage).to.have.property('message');
+    assert.neverCalledWith(event.emit, 'message.new-for-open-ai');
+  });
+  it('should forward message to OpenAI when Gladys Plus is configured', async () => {
+    const variable = {
+      getValue: fake.resolves('configured-value'),
+    };
+    const event = {
+      on: fake.returns(null),
+      emit: fake.returns(null),
+    };
+    const messageHandler = new MessageHandler(event, brain, service, {}, variable);
+    const message = {
+      text: 'Turn on the light in the kitchen',
+      language: 'en',
+      source: 'client-api',
+      source_user_id: userId,
+      user: {
+        id: userId,
+        language: 'en',
+      },
+      id: '5cd30aef-9c4e-4a23-88e3-3547971296e5',
+    };
+    const newMessage = await messageHandler.create(message);
+    expect(newMessage).to.have.property('message');
+    assert.calledWith(event.emit, 'message.new-for-open-ai', {
+      context: { user: { id: userId, language: 'en' } },
+      message,
+      previousQuestions: [],
+    });
+  });
+  it('should forward message to AI when an external AI provider is selected without Gladys Plus', async () => {
+    // Gladys Plus not configured, but the AI_PROVIDER variable points to an
+    // installed external AI integration: the AI path must be engaged
+    const variable = {
+      getValue: fake(async (variableName) => (variableName === 'AI_PROVIDER' ? 'ext-dev-claude-provider-demo' : null)),
+    };
+    const event = {
+      on: fake.returns(null),
+      emit: fake.returns(null),
+    };
+    const messageHandler = new MessageHandler(event, brain, service, {}, variable);
+    messageHandler.replyByIntent = fake.resolves(null);
+    const message = {
+      text: 'Turn on the light in the kitchen',
+      language: 'en',
+      source: 'client-api',
+      source_user_id: userId,
+      user: {
+        id: userId,
+        language: 'en',
+      },
+      id: '5cd30aef-9c4e-4a23-88e3-3547971296e5',
+    };
+    const newMessage = await messageHandler.create(message);
+    expect(newMessage).to.have.property('message');
+    assert.calledWith(event.emit, 'message.new-for-open-ai', {
+      context: { user: { id: userId, language: 'en' } },
+      message,
+      previousQuestions: [],
+    });
+    // and no "Gladys Plus required" fallback reply on top of the AI path
+    assert.notCalled(messageHandler.replyByIntent);
+  });
+  it('should forward message to OpenAI with previous questions context', async () => {
+    const variable = {
+      getValue: fake.resolves('configured-value'),
+    };
+    const event = {
+      on: fake.returns(null),
+      emit: fake.returns(null),
+    };
+    await db.Message.create({
+      text: 'Question 1',
+      sender_id: userId,
+      receiver_id: null,
+      is_read: true,
+      created_at: new Date('2023-02-09T09:55:05.766Z'),
+    });
+    await db.Message.create({
+      text: 'Answer 1',
+      sender_id: null,
+      receiver_id: userId,
+      is_read: true,
+      created_at: new Date('2023-02-09T09:56:05.766Z'),
+    });
+    await db.Message.create({
+      text: 'Question 2',
+      sender_id: userId,
+      receiver_id: null,
+      is_read: true,
+      created_at: new Date('2023-02-09T09:57:05.766Z'),
+    });
+    await db.Message.create({
+      text: 'Answer 2',
+      sender_id: null,
+      receiver_id: userId,
+      is_read: true,
+      created_at: new Date('2023-02-09T09:58:05.766Z'),
+    });
+    await db.Message.create({
+      text: 'Spontaneous message 3',
+      sender_id: null,
+      receiver_id: userId,
+      is_read: true,
+      created_at: new Date('2023-02-09T10:00:05.766Z'),
+    });
+    const messageHandler = new MessageHandler(event, brain, service, {}, variable);
+    const message = {
+      text: 'Turn on the light in the kitchen',
+      language: 'en',
+      source: 'client-api',
+      source_user_id: userId,
+      user: {
+        id: userId,
+        language: 'en',
+      },
+      id: '5cd30aef-9c4e-4a23-88e3-3547971296e5',
+    };
+    const newMessage = await messageHandler.create(message);
+    expect(newMessage).to.have.property('message');
+    assert.calledOnce(event.emit);
+    expect(event.emit.getCall(0).args[0]).to.equal('message.new-for-open-ai');
+    expect(event.emit.getCall(0).args[1]).to.deep.equal({
+      context: {
+        user: {
+          id: userId,
+          language: 'en',
+        },
+      },
+      message,
+      previousQuestions: [
+        { question: 'Question 1', answer: 'Answer 1' },
+        { question: 'Question 2', answer: 'Answer 2' },
+      ],
+    });
+  });
+});

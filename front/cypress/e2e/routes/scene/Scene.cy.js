@@ -1,0 +1,255 @@
+describe('Scene view', () => {
+  beforeEach(() => {
+    cy.login();
+  });
+  it('Should create new scene', () => {
+    cy.visit('/dashboard/scene');
+    cy.contains('scene.newButton')
+      .should('have.class', 'btn-outline-primary')
+      .click();
+
+    cy.url().should('eq', `${Cypress.config().baseUrl}/dashboard/scene/new`);
+
+    cy.get('input')
+      .first()
+      .as('sceneInput');
+    cy.get('@sceneInput').clear();
+    cy.get('@sceneInput').type('My Scene');
+
+    cy.get('.fe-activity').click();
+
+    cy.contains('newScene.createSceneButton')
+      .should('have.class', 'btn-primary')
+      .click();
+
+    cy.url().should('include', `${Cypress.config().baseUrl}/dashboard/scene/my-scene`);
+
+    cy.url().then(url => {
+      const relativeUrl = url.replace(Cypress.config().baseUrl, '');
+      Cypress.env('sceneUrl', relativeUrl);
+    });
+  });
+  it('Should edit the scene settings', () => {
+    const sceneUrl = Cypress.env('sceneUrl');
+    expect(sceneUrl).to.exist; // Ensure the scene URL is available
+    cy.visit(sceneUrl);
+
+    cy.get('[data-cy="edit-scene-settings-button"]').click();
+
+    cy.get('div[class*="form-group"]').then(inputs => {
+      cy.wrap(inputs[0])
+        .find('input')
+        .as('sceneNameInput');
+      cy.get('@sceneNameInput').clear();
+      cy.get('@sceneNameInput').type('My scene name');
+
+      cy.wrap(inputs[1])
+        .find('input')
+        .as('sceneDescriptionInput');
+
+      cy.get('@sceneDescriptionInput').type('My scene description');
+      cy.wrap(inputs[2]).type('My tag 1{enter}{enter}');
+    });
+
+    // I don't know why, but I'm unable to get this button with
+    // the text. Using the class but it's not recommended otherwise!!
+    cy.get('.btn-success').then(buttons => {
+      cy.wrap(buttons[0]).click();
+    });
+  });
+
+  it('Should add new condition house empty', () => {
+    const sceneUrl = Cypress.env('sceneUrl');
+    expect(sceneUrl).to.exist; // Ensure the scene URL is available
+    cy.visit(sceneUrl);
+    cy.contains('editScene.addStepButton')
+      .should('have.class', 'btn-outline-primary')
+      .click();
+
+    cy.get('[data-cy="type-picker-option"][data-value="house.is-empty"]').click();
+
+    cy.get('[data-cy="scene-house-empty-or-not-choose-house"] .react-select__control').click();
+
+    // The menu is rendered through a portal on <body> (components/form/Select.jsx),
+    // so it is queried from the document and not from the control — only one
+    // menu is open at a time. scrollBehavior: false because a portaled menu
+    // closes on any scroll: letting Cypress scroll the option into view would
+    // close the menu it is about to click.
+    cy.get('.react-select__menu')
+      .contains('.react-select__option', 'My House')
+      .click({ scrollBehavior: false });
+
+    cy.get('[data-cy="scene-house-empty-or-not-choose-house"]').should('contain', 'My House');
+  });
+
+  it('Should add new condition device set value', () => {
+    const serverUrl = Cypress.env('serverUrl');
+    cy.intercept(
+      {
+        method: 'GET',
+        url: `${serverUrl}/api/v1/room?expand=devices`
+      },
+      [
+        {
+          id: 'd63ce677-f5f8-47e1-816d-7aa227c863e4',
+          house_id: '6c1c78f0-1c26-4944-9149-77188e25d00d',
+          name: 'Living Room',
+          selector: 'living-room',
+          created_at: '2023-10-03T12:21:39.551Z',
+          updated_at: '2023-10-03T12:21:39.551Z',
+          devices: [
+            {
+              name: 'One device',
+              selector: 'one-device',
+              features: [
+                {
+                  name: 'Multilevel',
+                  selector: 'light-temperature',
+                  category: 'light',
+                  type: 'temperature',
+                  read_only: false,
+                  unit: null,
+                  min: 0,
+                  max: 1,
+                  last_value: null,
+                  last_value_changed: null
+                }
+              ],
+              service: { id: '123d4d56-6cbd-4020-991f-2a0a8e0ac3e0', name: 'mqtt' }
+            }
+          ]
+        }
+      ]
+    ).as('loadDevices');
+    cy.intercept(
+      {
+        method: 'GET',
+        url: `${serverUrl}/api/v1/device`
+      },
+      []
+    ).as('loadAllDevices');
+
+    const sceneUrl = Cypress.env('sceneUrl');
+    expect(sceneUrl).to.exist; // Ensure the scene URL is available
+    cy.visit(sceneUrl);
+    // the editor loads all devices on mount (collapsed step summaries): consume
+    // that call so the wait below matches the one of the device select
+    cy.wait('@loadAllDevices');
+    cy.contains('editScene.addStepButton')
+      .should('have.class', 'btn-outline-primary')
+      .click();
+
+    cy.get('[data-cy="type-picker-option"][data-value="device.set-value"]').click();
+
+    cy.wait('@loadDevices');
+    cy.wait('@loadAllDevices');
+    // eslint-disable-next-line cypress/no-unnecessary-waiting
+    cy.wait(100);
+
+    cy.get('div[class*="-control"]').then(inputs => {
+      cy.wrap(inputs[0]).as('deviceControl');
+      cy.get('@deviceControl').click(0, 0, { force: true });
+
+      cy.get('@deviceControl')
+        .get('[class*="-menu"]')
+        .find('[class*="-option"]')
+        .filter(`:contains("Multilevel")`)
+        .click(0, 0, { force: true });
+      cy.log('4');
+    });
+  });
+
+  it('Should add new calendar event trigger', () => {
+    const sceneUrl = Cypress.env('sceneUrl');
+    expect(sceneUrl).to.exist; // Ensure the scene URL is available
+    cy.visit(sceneUrl);
+    cy.contains('editScene.addNewTriggerButton')
+      .should('have.class', 'btn-outline-primary')
+      .click();
+
+    cy.get('[data-cy="type-picker-option"][data-value="calendar.event-is-coming"]').click();
+
+    cy.get('select').then(selects => {
+      cy.wrap(selects[0]).select('contains');
+      cy.wrap(selects[1]).select('start');
+      cy.wrap(selects[2]).select('minute');
+    });
+  });
+
+  it('Should disable scene', () => {
+    cy.visit('/dashboard/scene');
+
+    // Normally we shouldn't use CSS classes to identify element,
+    // but here we don't have much choice as there is no label
+    // on this element, and the checkbox is covered by this element
+    cy.get('.custom-switch-indicator').click();
+
+    const sceneUrl = Cypress.env('sceneUrl');
+    expect(sceneUrl).to.exist; // Ensure the scene URL is available
+    cy.visit(sceneUrl);
+
+    cy.get('[type="checkbox"]').should('not.be.checked');
+
+    cy.visit('/dashboard/scene');
+
+    cy.get('[type="checkbox"]').should('not.be.checked');
+
+    cy.get('.custom-switch-indicator').click();
+
+    cy.visit('/dashboard/scene');
+
+    cy.get('[type="checkbox"]').should('be.checked');
+  });
+  it('Should duplicate existing scene', () => {
+    cy.login();
+    const sceneUrl = Cypress.env('sceneUrl');
+    expect(sceneUrl).to.exist; // Ensure the scene URL is available
+    cy.visit(sceneUrl);
+
+    cy.contains('editScene.duplicateButton').click();
+
+    cy.url().should('eq', `${Cypress.config().baseUrl}${sceneUrl}/duplicate`);
+
+    cy.get('input')
+      .first()
+      .as('sceneInput');
+    cy.get('@sceneInput').clear();
+    cy.get('@sceneInput').type('My Duplicated scene');
+
+    cy.get('.fe-activity').click();
+
+    cy.get('.form-footer')
+      .contains('duplicateScene.duplicateSceneButton')
+      .should('have.class', 'btn-primary')
+      .click();
+
+    cy.url().should('include', `${Cypress.config().baseUrl}/dashboard/scene/my-duplicated-scene`);
+    cy.url().then(url => {
+      const relativeUrl = url.replace(Cypress.config().baseUrl, '');
+      Cypress.env('duplicatedSceneUrl', relativeUrl);
+    });
+  });
+
+  it('Should delete existing scene', () => {
+    cy.login();
+    const sceneUrl = Cypress.env('sceneUrl');
+    expect(sceneUrl).to.exist; // Ensure the scene URL is available
+    cy.visit(sceneUrl);
+
+    cy.contains('editScene.deleteButton').click();
+    // Confirmation button
+    cy.contains('editScene.deleteButton').click();
+
+    cy.url().should('eq', `${Cypress.config().baseUrl}/dashboard/scene`);
+
+    const duplicatedSceneUrl = Cypress.env('duplicatedSceneUrl');
+    expect(duplicatedSceneUrl).to.exist; // Ensure the scene URL is available
+    cy.visit(duplicatedSceneUrl);
+
+    cy.contains('editScene.deleteButton').click();
+    // Confirmation button
+    cy.contains('editScene.deleteButton').click();
+
+    cy.url().should('eq', `${Cypress.config().baseUrl}/dashboard/scene`);
+  });
+});

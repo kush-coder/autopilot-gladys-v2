@@ -1,0 +1,71 @@
+const logger = require('../../../utils/logger');
+const { findOwnContainer } = require('../../../utils/dockerContainers');
+
+const mqttContainerDescriptor = require('../docker/gladys-z2m-mqtt-container.json');
+const zigbee2mqttContainerDescriptor = require('../docker/gladys-z2m-zigbee2mqtt-container.json');
+
+/**
+ * @description Stop and remove one of our containers. A container carrying our
+ * name but not created by Gladys is left untouched.
+ * @param {object} system - Gladys system module.
+ * @param {object} descriptor - Container descriptor.
+ * @example
+ * await removeOwnContainer(gladys.system, mqttContainerDescriptor);
+ */
+async function removeOwnContainer(system, descriptor) {
+  const container = await findOwnContainer(system, descriptor);
+  if (container) {
+    await system.stopContainer(container.id);
+    await system.removeContainer(container.id);
+  }
+}
+
+/**
+ * @description Disconnect service from dependent containers.
+ * @example
+ * disconnect();
+ */
+async function disconnect() {
+  // Stop backup reccurent job
+  if (this.backupScheduledJob) {
+    this.backupScheduledJob.cancel();
+  }
+
+  // Disconnect from MQTT broker
+  if (this.mqttClient) {
+    logger.debug(`Disconnecting existing MQTT server...`);
+    this.mqttClient.end();
+    this.mqttClient.removeAllListeners();
+    this.mqttClient = null;
+  } else {
+    logger.debug('Not connected');
+  }
+  this.gladysConnected = false;
+  this.mqttConnectionError = null;
+  clearTimeout(this.healthCheckTimer);
+  this.healthCheckTimer = null;
+  this.emitStatusEvent();
+
+  // Stop & remove MQTT container
+  await removeOwnContainer(this.gladys.system, mqttContainerDescriptor);
+  this.mqttRunning = false;
+  this.mqttExist = false;
+  this.emitStatusEvent();
+
+  // Stop & remove zigbee2mqtt container
+  await removeOwnContainer(this.gladys.system, zigbee2mqttContainerDescriptor);
+  // Without its container, Zigbee2mqtt is disabled, not "not responding"
+  this.zigbee2mqttExist = false;
+  this.zigbee2mqttRunning = false;
+  this.zigbee2mqttConnected = false;
+  clearTimeout(this.startingTimer);
+  this.startingTimer = null;
+  this.zigbee2mqttStarting = false;
+  this.coordinatorFirmware = null;
+  this.z2mContainerError = null;
+  this.emitStatusEvent();
+}
+
+module.exports = {
+  disconnect,
+};

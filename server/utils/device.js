@@ -1,0 +1,345 @@
+const get = require('get-value');
+
+const {
+  DEVICE_FEATURE_CATEGORIES,
+  DEVICE_FEATURE_TYPES,
+  MUSIC_STRING_FEATURE_TYPES,
+  MAX_MUSIC_TEXT_LENGTH,
+  MUSIC_ARTWORK_KEY_REGEX,
+} = require('./constants');
+
+/**
+ * @description Get Device param by name.
+ * @param {object} device - Device Object to parse.
+ * @param {string} paramName - The name of the param to get.
+ * @returns {string} Return param.
+ * @example
+ * const value = getDeviceParam({
+ *  params: [{ name: 'test', value: 1 }]
+ * }, 'test');
+ */
+function getDeviceParam(device, paramName) {
+  if (!get(device, 'params')) {
+    return null;
+  }
+  const param = device.params.find((oneParam) => oneParam.name === paramName);
+  if (param) {
+    return param.value;
+  }
+  return null;
+}
+
+/**
+ * @description Set Device param by name.
+ * @param {object} device - Device Object to parse.
+ * @param {string} paramName - The name of the param to get.
+ * @param {string} newValue - The value to set.
+ * @returns {null} Return when object was modified.
+ * @example
+ * setDeviceParam({
+ *  params: [{ name: 'test', value: 1 }]
+ * }, 'test', 'new-value');
+ */
+function setDeviceParam(device, paramName, newValue) {
+  if (!device.params) {
+    device.params = [];
+  }
+  const param = device.params.find((oneParam) => oneParam.name === paramName);
+  if (param) {
+    param.value = newValue;
+  } else {
+    device.params.push({
+      name: paramName,
+      value: newValue,
+    });
+  }
+  return null;
+}
+
+/**
+ * @description Get Device param by name.
+ * @param {object} device - Device Object to parse.
+ * @param {string} category - The category of the feature to get.
+ * @param {string} type - The type of the feature to get.
+ * @returns {object} Return feature.
+ * @example
+ * const value = getDeviceFeature({
+ *  features: [{ category: 'light', type: 'binary' }]
+ * }, 'light', 'binary');
+ */
+function getDeviceFeature(device, category, type) {
+  if (!get(device, 'features')) {
+    return null;
+  }
+  const feature = device.features.find((oneFeature) => oneFeature.category === category && oneFeature.type === type);
+  if (feature) {
+    return feature;
+  }
+  return null;
+}
+
+/**
+ * @description Tell if a camera is enabled (spec docs/specs/camera-enable-disable.md).
+ * A camera is enabled unless it exposes a `camera`/`enabled` feature whose last value is 0.
+ * Cameras without that feature — created before it existed, or by an integration that does not
+ * expose it — are always considered enabled, and so is every non-camera device.
+ * @param {object} device - The device to check.
+ * @returns {boolean} Return false only when the device is a camera explicitly disabled.
+ * @example
+ * isCameraEnabled({ features: [{ category: 'camera', type: 'enabled', last_value: 0 }] });
+ */
+function isCameraEnabled(device) {
+  const enabledFeature = getDeviceFeature(
+    device,
+    DEVICE_FEATURE_CATEGORIES.CAMERA,
+    DEVICE_FEATURE_TYPES.CAMERA.ENABLED,
+  );
+  if (enabledFeature === null) {
+    return true;
+  }
+  return enabledFeature.last_value !== 0;
+}
+
+/**
+ * @description Tell if a feature holds a string state because of its category and type: a
+ * `text` feature, or one of the string types of the `music` category (title, artist, album,
+ * artwork — capabilities/music.md, section 1). The core routes these to saveStringState
+ * whatever the shape of the event, so an empty string is a valid "nothing loaded" state.
+ * @param {object} deviceFeature - The device feature.
+ * @returns {boolean} True when the feature's state is a string.
+ * @example
+ * isStringStateFeature({ category: 'music', type: 'title' });
+ */
+function isStringStateFeature(deviceFeature) {
+  if (deviceFeature.category === DEVICE_FEATURE_CATEGORIES.TEXT) {
+    return (
+      deviceFeature.type === DEVICE_FEATURE_TYPES.TEXT.TEXT || deviceFeature.type === DEVICE_FEATURE_TYPES.TEXT.SELECT
+    );
+  }
+  return (
+    deviceFeature.category === DEVICE_FEATURE_CATEGORIES.MUSIC &&
+    MUSIC_STRING_FEATURE_TYPES.includes(deviceFeature.type)
+  );
+}
+
+/**
+ * @description Bound a string state before it is saved: a music text is truncated at
+ * MAX_MUSIC_TEXT_LENGTH, a music artwork must be an image key (or empty) — null when refused.
+ * Other string features are returned as they are.
+ * @param {object} deviceFeature - The device feature.
+ * @param {string} value - The string state.
+ * @returns {string|null} The bounded state, or null when it must not be saved.
+ * @example
+ * normalizeStringState({ category: 'music', type: 'artwork' }, 'art-3f9a2c');
+ */
+function normalizeStringState(deviceFeature, value) {
+  const stringValue = String(value);
+  if (deviceFeature.category !== DEVICE_FEATURE_CATEGORIES.MUSIC) {
+    return stringValue;
+  }
+  if (deviceFeature.type === DEVICE_FEATURE_TYPES.MUSIC.ARTWORK) {
+    return stringValue === '' || MUSIC_ARTWORK_KEY_REGEX.test(stringValue) ? stringValue : null;
+  }
+  return stringValue.substring(0, MAX_MUSIC_TEXT_LENGTH);
+}
+
+/**
+ * @description Add or update a param to a device.
+ * @param {object} device - Device to add parameter.
+ * @param {object} feature - The feature to add.
+ * @returns {object} The device.
+ * @example
+ * setDeviceFeature({ features: [] }, { selector: 'feature' })
+ */
+function setDeviceFeature(device, feature) {
+  let { features } = device;
+  if (!features) {
+    features = [];
+    device.features = features;
+  }
+
+  const featureIndex = features.findIndex((p) => p.selector === feature.selector);
+  if (featureIndex >= 0) {
+    features[featureIndex] = feature;
+  } else {
+    features.push(feature);
+  }
+
+  return device;
+}
+
+const matchFeature = (features, feature) => {
+  return features.findIndex((f) => f.external_id === feature.external_id);
+};
+
+const matchParam = (params, param) => {
+  return params.findIndex((p) => p.name === param.name && p.value === param.value);
+};
+
+/**
+ * @description Compares both argument devices and check if any changes occurred on following attributes:
+ *  - features: check for added or deleted features (based only on external_id)
+ *  - params: check for added, updated or deleted (based on name and value).
+ * @param {object} newDevice - New device.
+ * @param {object} existingDevice - Existing device.
+ * @returns {boolean} Indicates if the new device is different from the existing one.
+ * @example
+ * hasDeviceChanged({ features: [(3)], params: [ ... ]}, { features: [(0)], params: [ ... ]})
+ */
+function hasDeviceChanged(newDevice, existingDevice = {}) {
+  const { features, params } = newDevice;
+  const existingFeatures = existingDevice.features || [];
+  const existingParams = existingDevice.params || [];
+
+  let deviceChanged = existingFeatures.length !== features.length || existingParams.length !== params.length;
+  let i = 0;
+  while (!deviceChanged && features[i]) {
+    deviceChanged = matchFeature(existingFeatures, features[i]) < 0;
+    i += 1;
+  }
+
+  i = 0;
+  while (!deviceChanged && params[i]) {
+    deviceChanged = matchParam(existingParams, params[i]) < 0;
+    i += 1;
+  }
+
+  return deviceChanged;
+}
+
+/**
+ * @description Merge feature attributes from existing with the new one.
+ * It keeps 'name' and 'keep_history' attribute from existing.
+ * @param {object} newFeature - Newly created feature.
+ * @param {object} [existingFeature] - Already existing feature.
+ * @param {object} [featureIdMap] - Map of feature id to existing feature id.
+ * @returns {object} A new feature merged with existing one.
+ * @example
+ * mergeFeatures({ name: 'Default name' }, { name: 'Overriden name' })
+ */
+function mergeFeatures(newFeature, existingFeature = {}, featureIdMap = new Map()) {
+  const featureToReturn = { ...newFeature };
+
+  if (existingFeature && existingFeature.name) {
+    featureToReturn.name = existingFeature.name;
+  }
+
+  if (existingFeature && existingFeature.keep_history !== undefined) {
+    featureToReturn.keep_history = existingFeature.keep_history;
+  }
+
+  if (existingFeature && existingFeature.id) {
+    featureToReturn.id = existingFeature.id;
+    if (newFeature.id) {
+      featureIdMap.set(newFeature.id, existingFeature.id);
+    }
+  }
+
+  if (existingFeature && existingFeature.energy_parent_id) {
+    featureToReturn.energy_parent_id = existingFeature.energy_parent_id;
+  }
+
+  return featureToReturn;
+}
+
+/**
+ * @description Merge device attributes from existing with the new one.
+ * It keeps 'name', 'room_id' attributes from existing.
+ * @param {object} newDevice - Newly created device.
+ * @param {object} existingDevice - Already existing device.
+ * @param {string} updateAttribute - The attribute to add on the device to check if it is still new or update.
+ * @returns {object} A new device merged with existing one, or the new device if it didn't change.
+ * @example
+ * mergeDevices({ name: 'Default name', features: [] }, { name: 'Overriden name', features: [] })
+ */
+function mergeDevices(newDevice, existingDevice, updateAttribute = 'updatable') {
+  // No existing device
+  if (!existingDevice) {
+    return newDevice;
+  }
+
+  const { features: newFeatures = [], params: newParams = [] } = newDevice;
+  const { features: oldFeatures = [], params: oldParams = [], name, room_id: roomId } = existingDevice;
+
+  let deviceChanged = oldFeatures.length !== newFeatures.length || oldParams.length !== newParams.length;
+
+  // Group old features by external id
+  const oldFeatureByExternalId = {};
+  oldFeatures.forEach((oldFeature) => {
+    oldFeatureByExternalId[oldFeature.external_id] = oldFeature;
+  });
+
+  const featureIdMap = new Map();
+
+  // Merge matching features
+  const features = newFeatures.map((newFeature) => {
+    const oldFeature = oldFeatureByExternalId[newFeature.external_id];
+
+    if (!oldFeature) {
+      deviceChanged = true;
+      // If there is a new energy parent id, we need to get the correct id if the feature already existed
+      if (newFeature.energy_parent_id && featureIdMap.get(newFeature.energy_parent_id)) {
+        newFeature.energy_parent_id = featureIdMap.get(newFeature.energy_parent_id);
+      }
+      return newFeature;
+    }
+
+    return mergeFeatures(newFeature, oldFeature, featureIdMap);
+  });
+
+  let i = 0;
+  while (!deviceChanged && newParams[i]) {
+    deviceChanged = matchParam(oldParams, newParams[i]) < 0;
+    i += 1;
+  }
+
+  return { ...existingDevice, ...newDevice, name, room_id: roomId, features, [updateAttribute]: deviceChanged };
+}
+
+/**
+ * @description Normalize value to new range and clamp it within target bounds.
+ * Values outside the source range are mapped then clamped so callers (e.g. HomeKit)
+ * never receive a value outside [newRangeMin, newRangeMax].
+ * @param {number} value - Actual value.
+ * @param {number} currentMin - Actual possible min value.
+ * @param {number} currentMax - Actual possible max value.
+ * @param {number} newRangeMin - Target possible min value.
+ * @param {number} newRangeMax - Target possible max value.
+ * @returns {number} New value in target range.
+ * @example
+ * normalize(5, 0, 255, 0, 360)
+ */
+function normalize(value, currentMin, currentMax, newRangeMin, newRangeMax) {
+  if (currentMax === currentMin) {
+    return newRangeMin;
+  }
+  const normalized = ((newRangeMax - newRangeMin) * (value - currentMin)) / (currentMax - currentMin) + newRangeMin;
+  const lowerBound = Math.min(newRangeMin, newRangeMax);
+  const upperBound = Math.max(newRangeMin, newRangeMax);
+  return Math.min(upperBound, Math.max(lowerBound, normalized));
+}
+
+/**
+ * @description Check if variable is number.
+ * @param {string|number} n - Variable to check.
+ * @returns {boolean} Return true if variable is number.
+ * @example isNumeric(12)
+ */
+function isNumeric(n) {
+  return !Number.isNaN(parseFloat(n)) && Number.isFinite(n);
+}
+
+module.exports = {
+  getDeviceParam,
+  setDeviceParam,
+  getDeviceFeature,
+  isCameraEnabled,
+  isStringStateFeature,
+  normalizeStringState,
+  setDeviceFeature,
+  hasDeviceChanged,
+  mergeFeatures,
+  mergeDevices,
+  normalize,
+  isNumeric,
+};

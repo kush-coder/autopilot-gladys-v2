@@ -1,0 +1,291 @@
+import get from 'get-value';
+
+import { ACTIONS, EVENTS } from '../../../../../server/utils/constants';
+import { isWildcardValue } from './sceneIntegrations';
+import getDeviceFeatureValueOptions from '../../../utils/deviceFeatureValueOptions';
+import { getDeviceFeatureName } from '../../../utils/device';
+
+const truncate = (text, maxLength = 60) => {
+  if (typeof text !== 'string') {
+    return null;
+  }
+  const trimmed = text.trim();
+  if (trimmed === '') {
+    return null;
+  }
+  return trimmed.length > maxLength ? `${trimmed.slice(0, maxLength)}…` : trimmed;
+};
+
+const joinParts = parts => {
+  const filtered = parts.filter(part => part !== null && part !== undefined && part !== '');
+  return filtered.length > 0 ? filtered.join(' · ') : null;
+};
+
+// The filled parameters of an integration-declared step ("camera: front,
+// label: person, car"), the wildcards left out
+const listDeclaredFields = fields => {
+  if (!fields || typeof fields !== 'object') {
+    return null;
+  }
+  const parts = Object.keys(fields)
+    .filter(key => !isWildcardValue(fields[key]))
+    .map(key => `${key}: ${Array.isArray(fields[key]) ? fields[key].join(', ') : fields[key]}`);
+  return parts.length > 0 ? truncate(parts.join(' · ')) : null;
+};
+
+const listSelectors = selectors => {
+  if (!Array.isArray(selectors) || selectors.length === 0) {
+    return null;
+  }
+  return truncate(selectors.join(', '));
+};
+
+// The device name of a feature selector once the devices are loaded, the raw
+// selector until then (or if the feature was deleted)
+const getFeatureLabel = (selector, dictionary, deviceFeatures) => {
+  const { device, feature } = (deviceFeatures && deviceFeatures[selector]) || {};
+  return truncate(device ? getDeviceFeatureName(dictionary, device, feature) : selector);
+};
+
+// The device names of device selectors once the devices are loaded, the raw
+// selector until then (or if the device was deleted)
+const listDeviceNames = (selectors, deviceFeatures) => {
+  if (!Array.isArray(selectors) || selectors.length === 0) {
+    return null;
+  }
+  const entries = deviceFeatures ? Object.values(deviceFeatures) : [];
+  const names = selectors.map(selector => {
+    const entry = entries.find(({ device }) => device.selector === selector);
+    return entry ? entry.device.name : selector;
+  });
+  return truncate(names.join(', '));
+};
+
+// Builds a short human-readable summary of a configured action, displayed when
+// its card is collapsed. Returns null when there is nothing meaningful to show:
+// the card then only displays the action type label. deviceFeatures maps a
+// feature selector to its { device, feature }, and thermostatSchedules a
+// schedule selector to its name, both null while loading.
+const getActionSummary = (action, dictionary, deviceFeatures, thermostatSchedules) => {
+  if (!action || !action.type) {
+    return null;
+  }
+  switch (action.type) {
+    case ACTIONS.TIME.DELAY: {
+      if (action.evaluate_value) {
+        return truncate(String(action.evaluate_value));
+      }
+      if (action.value === undefined || action.value === null || action.value === '') {
+        return null;
+      }
+      const unitLabel = action.unit ? get(dictionary, `editScene.actionsCard.delay.${action.unit}`) : null;
+      return joinParts([`${action.value} ${unitLabel || action.unit || ''}`.trim()]);
+    }
+    case ACTIONS.MESSAGE.SEND:
+    case ACTIONS.MESSAGE.SEND_CAMERA:
+    case ACTIONS.SMS.SEND:
+    case ACTIONS.AI.ASK:
+      return joinParts([action.user, truncate(action.text)]);
+    case ACTIONS.MUSIC.PLAY_NOTIFICATION:
+      return truncate(action.text);
+    case ACTIONS.MUSIC.PLAY_MEDIA:
+      return joinParts([action.device, action.media ? truncate(action.media.title || action.media.id) : null]);
+    case ACTIONS.MQTT.SEND:
+    case ACTIONS.ZIGBEE2MQTT.SEND:
+      return truncate(action.topic);
+    case ACTIONS.EXTERNAL_INTEGRATION.SCENE_ACTION:
+      return listDeclaredFields(action.fields);
+    case ACTIONS.HTTP.REQUEST:
+      return joinParts([action.method ? String(action.method).toUpperCase() : null, truncate(action.url)]);
+    case ACTIONS.SCENE.START:
+      return truncate(action.scene);
+    case ACTIONS.VARIABLE.SET:
+      return truncate(action.name);
+    case ACTIONS.ALARM.SET_ALARM_MODE:
+    case ACTIONS.ALARM.CHECK_ALARM_MODE:
+      return joinParts([action.house, action.alarm_mode]);
+    case ACTIONS.HOUSE.IS_EMPTY:
+    case ACTIONS.HOUSE.IS_NOT_EMPTY:
+      return truncate(action.house);
+    case ACTIONS.USER.SET_SEEN_AT_HOME:
+    case ACTIONS.USER.SET_OUT_OF_HOME:
+    case ACTIONS.USER.CHECK_PRESENCE:
+      return joinParts([action.user, action.house]);
+    case ACTIONS.DEVICE.GET_VALUE:
+      return getFeatureLabel(action.device_feature, dictionary, deviceFeatures);
+    case ACTIONS.DEVICE.SET_VALUE: {
+      const hasEvaluateValue =
+        action.evaluate_value !== undefined && action.evaluate_value !== null && action.evaluate_value !== '';
+      const value = hasEvaluateValue ? action.evaluate_value : action.value;
+      // Until the devices are loaded (or if the feature was deleted), the raw selector and value are shown
+      const { feature } = (deviceFeatures && deviceFeatures[action.device_feature]) || {};
+      let valueLabel = value !== undefined && value !== null && value !== '' ? String(value) : null;
+      if (feature && valueLabel !== null && !hasEvaluateValue) {
+        const valueOption = (getDeviceFeatureValueOptions(dictionary, feature) || []).find(
+          option => `${option.value}` === valueLabel
+        );
+        if (valueOption) {
+          valueLabel = valueOption.label;
+        }
+      }
+      return joinParts([
+        getFeatureLabel(action.device_feature, dictionary, deviceFeatures),
+        valueLabel !== null ? truncate(valueLabel, 20) : null
+      ]);
+    }
+    case ACTIONS.LIGHT.TURN_ON:
+    case ACTIONS.LIGHT.TURN_OFF:
+    case ACTIONS.LIGHT.TOGGLE:
+    case ACTIONS.LIGHT.BLINK:
+      return listSelectors(action.devices);
+    case ACTIONS.SWITCH.TURN_ON:
+    case ACTIONS.SWITCH.TURN_OFF:
+    case ACTIONS.SWITCH.TOGGLE:
+      return listSelectors(action.devices || action.device_features);
+    case ACTIONS.THERMOSTAT.SET_SCHEDULE:
+      // A schedule selector is a slug plus a timestamp plus a random suffix
+      // (school-holidays-1792941482500-tk5w): its name reads.
+      return joinParts([
+        truncate((thermostatSchedules && thermostatSchedules[action.schedule]) || action.schedule),
+        listDeviceNames(action.devices, deviceFeatures)
+      ]);
+    case ACTIONS.CONDITION.ONLY_CONTINUE_IF: {
+      if (!Array.isArray(action.conditions) || action.conditions.length === 0) {
+        return null;
+      }
+      const [first] = action.conditions;
+      const value =
+        first.evaluate_value !== undefined && first.evaluate_value !== null && first.evaluate_value !== ''
+          ? first.evaluate_value
+          : first.value;
+      const firstText = [first.variable, first.operator, value]
+        .filter(part => part !== null && part !== undefined && part !== '')
+        .join(' ');
+      return joinParts([truncate(firstText), action.conditions.length > 1 ? `+${action.conditions.length - 1}` : null]);
+    }
+    case ACTIONS.CALENDAR.IS_EVENT_RUNNING:
+      return joinParts([listSelectors(action.calendars), truncate(action.calendar_event_name)]);
+    case ACTIONS.CALENDAR.GET_EVENTS: {
+      let timeRange = null;
+      if (action.time_range === 'today' || action.time_range === 'tomorrow') {
+        timeRange =
+          get(dictionary, `editScene.actionsCard.calendarGetEvents.${action.time_range}`) || action.time_range;
+      } else if (action.time_range === 'next-x-hours') {
+        const label = get(dictionary, 'editScene.actionsCard.calendarGetEvents.nextXHours') || action.time_range;
+        timeRange = action.duration ? label.replace('X', String(action.duration)) : label;
+      }
+      return joinParts([listSelectors(action.calendars), truncate(action.calendar_event_name), timeRange]);
+    }
+    case ACTIONS.ECOWATT.CONDITION:
+      if (!action.ecowatt_network_status) {
+        return null;
+      }
+      return (
+        get(dictionary, `editScene.actionsCard.ecowattCondition.${action.ecowatt_network_status}`) ||
+        action.ecowatt_network_status
+      );
+    case ACTIONS.EDF_TEMPO.CONDITION: {
+      const tempoLabel = key => get(dictionary, `editScene.actionsCard.edfTempoCondition.${key}`) || key;
+      const peakDayKeys = { blue: 'blueDay', white: 'whiteDay', red: 'redDay' };
+      const peakHourKeys = { 'peak-hour': 'peakHour', 'off-peak-hour': 'offPeakHour' };
+      return joinParts([
+        action.edf_tempo_day ? tempoLabel(action.edf_tempo_day) : null,
+        peakDayKeys[action.edf_tempo_peak_day_type] ? tempoLabel(peakDayKeys[action.edf_tempo_peak_day_type]) : null,
+        // The peak hour check only applies to the current day: the editor hides
+        // (but keeps) the field when the step targets tomorrow
+        action.edf_tempo_day === 'today' && peakHourKeys[action.edf_tempo_peak_hour_type]
+          ? tempoLabel(peakHourKeys[action.edf_tempo_peak_hour_type])
+          : null
+      ]);
+    }
+    case ACTIONS.ENERGY_CONTRACT.CURRENT_PRICE:
+      return joinParts([
+        truncate(action.energy_contract),
+        action.operator && action.value !== undefined && action.value !== null && action.value !== ''
+          ? `${action.operator} ${action.value}`
+          : null
+      ]);
+    case ACTIONS.CONDITION.CHECK_TIME: {
+      const days = Array.isArray(action.days_of_the_week)
+        ? action.days_of_the_week
+            .map(day => get(dictionary, `editScene.triggersCard.scheduledTrigger.daysOfTheWeek.${day}`) || day)
+            .join(', ')
+        : null;
+      return joinParts([action.after ? `≥ ${action.after}` : null, action.before ? `≤ ${action.before}` : null, days]);
+    }
+    default:
+      return null;
+  }
+};
+
+// Builds a short human-readable summary of a configured trigger, displayed when
+// its card is collapsed
+const getTriggerSummary = (trigger, dictionary) => {
+  if (!trigger || !trigger.type) {
+    return null;
+  }
+  const translateDays = days =>
+    Array.isArray(days)
+      ? days
+          .map(day => get(dictionary, `editScene.triggersCard.scheduledTrigger.daysOfTheWeek.${day}`) || day)
+          .join(', ')
+      : null;
+  switch (trigger.type) {
+    case EVENTS.DEVICE.NEW_STATE:
+      return joinParts([
+        listSelectors(trigger.device_features) || truncate(trigger.device_feature),
+        trigger.operator && trigger.value !== undefined && trigger.value !== null
+          ? `${trigger.operator} ${trigger.value}`
+          : null
+      ]);
+    case EVENTS.TIME.CHANGED:
+      if (trigger.scheduler_type === 'time-range') {
+        // The days alone said nothing of the planning itself.
+        const ranges = (trigger.time_ranges || [])
+          .filter(range => range.start && range.end)
+          .map(range => `${range.start}–${range.end}`)
+          .join(', ');
+        return joinParts([truncate(ranges), translateDays(trigger.days_of_the_week)]);
+      }
+      return joinParts([
+        trigger.time,
+        trigger.date,
+        translateDays(trigger.days_of_the_week),
+        trigger.interval && trigger.unit ? `${trigger.interval} ${trigger.unit}` : null
+      ]);
+    case EVENTS.TIME.SUNRISE:
+    case EVENTS.TIME.SUNSET:
+      return truncate(trigger.house);
+    case EVENTS.CALENDAR.EVENT_IS_COMING:
+      return joinParts([listSelectors(trigger.calendars), truncate(trigger.calendar_event_name)]);
+    case EVENTS.USER_PRESENCE.BACK_HOME:
+    case EVENTS.USER_PRESENCE.LEFT_HOME:
+      return joinParts([trigger.user, trigger.house]);
+    case EVENTS.HOUSE.EMPTY:
+    case EVENTS.HOUSE.NO_LONGER_EMPTY:
+      return truncate(trigger.house);
+    case EVENTS.AREA.USER_ENTERED:
+    case EVENTS.AREA.USER_LEFT:
+      return joinParts([trigger.user, trigger.area]);
+    case EVENTS.ALARM.ARM:
+    case EVENTS.ALARM.ARMING:
+    case EVENTS.ALARM.PARTIAL_ARM:
+    case EVENTS.ALARM.DISARM:
+    case EVENTS.ALARM.PANIC:
+    case EVENTS.ALARM.TOO_MANY_CODES_TESTS:
+      return truncate(trigger.house);
+    case EVENTS.MQTT.RECEIVED:
+      return truncate(trigger.topic);
+    case EVENTS.WEATHER.ALERT_RAISED:
+    case EVENTS.WEATHER.ALERT_ENDED:
+      return joinParts([trigger.house, trigger.weather_alert_type]);
+    case EVENTS.ENERGY_CONTRACT.PRICE_CHANGED:
+      return truncate(trigger.energy_contract);
+    case EVENTS.EXTERNAL_INTEGRATION.SCENE_EVENT:
+      return listDeclaredFields(trigger.fields);
+    default:
+      return null;
+  }
+};
+
+export { getActionSummary, getTriggerSummary };

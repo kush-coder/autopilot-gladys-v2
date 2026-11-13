@@ -1,0 +1,42 @@
+@media (min-width: 576px) {
+  .calendarEventIsComingMarginInputMargin {
+    margin-top: 27px;
+  }
+}
+
+@media (max-width: 576px) {
+  .calendarEventIsComingGroupMargin {
+    margin-top: 12px;
+  }
+}
+
+/* The theme ships `white-space: nowrap` on `.btn`: in the "device state change"
+   trigger the state buttons have a fixed column width, so a long label
+   ("Mouvement détecté", "Pas de mouvement", and their equivalent in other
+   languages) overflows the button instead of being displayed. Let the label
+   wrap on several lines, and stretch the button to the height of its column so
+   a pair of buttons stays aligned when only one of them wraps. */
+.deviceStateButton {
+  flex: 1;
+  height: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* Days of the week of a time-range trigger: seven checkboxes on one line, wrapping
+   only when the container is too narrow (mobile). Checkboxes rather than toggle
+   buttons: with seven of them side by side, a tick mark says "selected" at a glance,
+   where two shades of the button palette are easy to read the wrong way round. */
+.timeRangeDays {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+}
+
+/* The theme lays .custom-control out as a block, for checkboxes stacked vertically.
+   Only the display is overridden: the left padding it reserves is what the tick mark
+   (positioned absolutely inside the control) sits in, so it must be kept. */
+.timeRangeDay {
+  display: inline-block;
+  margin-bottom: 0;
+}

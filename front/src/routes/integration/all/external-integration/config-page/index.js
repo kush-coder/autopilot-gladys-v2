@@ -1,0 +1,806 @@
+import { Component } from 'preact';
+import { connect } from 'unistore/preact';
+import get from 'get-value';
+
+import ExternalIntegrationPage from '../ExternalIntegrationPage';
+import ConfigTab from './ConfigTab';
+import { getRequestedHardwareClasses } from '../utils';
+import { hasDynamicSource, fetchDynamicOptions } from '../../../../../components/integration/dynamicOptions';
+import { RequestStatus } from '../../../../../utils/consts';
+import {
+  OAUTH_REDIRECT_URI,
+  assertOpenableUrl,
+  getAuthorizeUrlState,
+  getOAuthCallbackPath,
+  wrapAuthorizeUrl
+} from '../../../../../utils/oauth';
+import { USER_ROLE, WEBSOCKET_MESSAGE_TYPES } from '../../../../../../../server/utils/constants';
+
+const OAUTH_USE_INSTANCE_REDIRECT_KEY = 'externalIntegrationOAuthUseInstanceRedirect';
+
+class ExternalIntegrationConfigPage extends Component {
+  // a non-admin user only gets the "my account" part of this screen: the
+  // shared configuration of the integration is administration (and its
+  // routes are admin-only, so they must not even be called)
+  isAdmin = () => get(this.props, 'user.role') === USER_ROLE.ADMIN;
+
+  loadData = async () => {
+    // action values and results belong to the integration they were typed
+    // for: a secret typed for one integration is never sent to another
+    // the dynamic options of the previous integration must never fill the
+    // selects of the new one
+    this.setState({ loadStatus: RequestStatus.Getting, actionFieldValues: {}, actionStates: {}, dynamicOptions: {} });
+    const { selector } = this.props;
+    const isAdmin = this.isAdmin();
+    try {
+      const [integration, configResponse] = await Promise.all([
+        this.props.httpClient.get(`/api/v1/external_integration/${selector}`),
+        isAdmin ? this.props.httpClient.get(`/api/v1/external_integration/${selector}/config`) : Promise.resolve({})
+      ]);
+      if (selector !== this.props.selector) {
+        // a newer request has started since, discard this stale result
+        return;
+      }
+      const configValues = this.buildConfigValues(integration, configResponse);
+      this.setState({
+        integration,
+        configValues,
+        configuredSecrets: configResponse.configured_secrets || [],
+        touchedSecrets: {},
+        actionFieldValues: this.buildActionFieldValues(integration),
+        grantedDevices: integration.granted_devices || [],
+        loadStatus: RequestStatus.Success
+      });
+      if (get(integration, 'manifest.type') === 'communication') {
+        // chat channels (receive true, the default) link by code;
+        // send-only notification channels load the "My account" values
+        if (get(integration, 'manifest.messaging.receive') !== false) {
+          await this.loadContact();
+        }
+        if ((get(integration, 'manifest.contact_schema') || []).length > 0) {
+          await this.loadContactProfile();
+        }
+      }
+      if (get(integration, 'manifest.type') === 'calendar') {
+        // the per-user "My calendars" block of a calendar integration
+        await this.loadCalendarAccount(integration);
+      }
+      await this.loadDynamicOptions(integration, isAdmin, selector);
+      if (isAdmin) {
+        await this.loadGatewayStatus(integration);
+        await this.loadHardwareDetection(integration);
+      }
+    } catch (e) {
+      console.error(e);
+      if (selector !== this.props.selector) {
+        return;
+      }
+      // never keep the data of a previous integration displayed and savable
+      this.setState({
+        loadStatus: RequestStatus.Error,
+        integration: null,
+        configValues: {},
+        configuredSecrets: [],
+        touchedSecrets: {}
+      });
+    }
+  };
+
+  // the stored values, completed with the declared defaults of the fields
+  // that have none (never for a secret, whose value never comes back)
+  applySchemaDefaults = (schema, storedValues) => {
+    const values = Object.assign({}, storedValues);
+    schema.forEach(field => {
+      const currentValue = values[field.key];
+      if ((currentValue === undefined || currentValue === null) && field.type !== 'secret') {
+        if (field.default !== undefined) {
+          values[field.key] = field.default;
+        }
+      }
+    });
+    return values;
+  };
+
+  buildConfigValues = (integration, configResponse) =>
+    this.applySchemaDefaults(get(integration, 'manifest.config_schema') || [], configResponse.config);
+
+  // the "My calendars" form starts from the account_schema defaults too: a
+  // boolean declared `default: true` is on before the first Enable, and after
+  // a disable
+  buildCalendarAccountValues = (integration, calendarAccount) =>
+    this.applySchemaDefaults(get(integration, 'manifest.account_schema') || [], calendarAccount.config);
+
+  // the action forms start from the declared defaults, like the config form
+  // (an action field without a default stays empty)
+  buildActionFieldValues = integration => {
+    const actionFieldValues = {};
+    (get(integration, 'manifest.actions') || []).forEach(action => {
+      const values = {};
+      (action.fields || []).forEach(field => {
+        if (field.default !== undefined) {
+          values[field.key] = field.default;
+        }
+      });
+      actionFieldValues[action.key] = values;
+    });
+    return actionFieldValues;
+  };
+
+  updateConfigValue = (field, value) => {
+    const configValues = Object.assign({}, this.state.configValues, { [field.key]: value });
+    const newState = { configValues, saveConfigStatus: null };
+    if (field.type === 'secret') {
+      newState.touchedSecrets = Object.assign({}, this.state.touchedSecrets, { [field.key]: true });
+    }
+    this.setState(newState);
+  };
+
+  saveConfig = async e => {
+    if (e) {
+      e.preventDefault();
+    }
+    this.setState({ saveConfigStatus: RequestStatus.Getting });
+    const { integration, configValues = {}, touchedSecrets = {} } = this.state;
+    const schema = get(integration, 'manifest.config_schema') || [];
+    const config = {};
+    schema.forEach(field => {
+      const value = configValues[field.key];
+      if (field.type === 'secret') {
+        // A secret set to null means "unchanged" on the server side
+        config[field.key] = touchedSecrets[field.key] ? value : null;
+      } else if (field.type === 'number') {
+        // empty or malformed numeric inputs are simply not sent
+        // (the server merge is partial, absent keys stay unchanged)
+        const numericValue = value === '' || value === undefined || value === null ? NaN : Number(value);
+        if (!Number.isNaN(numericValue)) {
+          config[field.key] = numericValue;
+        }
+      } else if (field.type === 'boolean') {
+        config[field.key] = !!value;
+      } else if (value !== undefined && value !== null) {
+        config[field.key] = value;
+      }
+    });
+    try {
+      const configResponse = await this.props.httpClient.post(
+        `/api/v1/external_integration/${this.props.selector}/config`,
+        { config }
+      );
+      const configValuesRefreshed = this.buildConfigValues(this.state.integration, configResponse);
+      this.setState({
+        configValues: configValuesRefreshed,
+        configuredSecrets: configResponse.configured_secrets || [],
+        touchedSecrets: {},
+        saveConfigStatus: RequestStatus.Success
+      });
+    } catch (err) {
+      console.error(err);
+      this.setState({ saveConfigStatus: RequestStatus.Error });
+    }
+  };
+
+  loadContact = async () => {
+    try {
+      const contact = await this.props.httpClient.get(`/api/v1/external_integration/${this.props.selector}/contact`);
+      this.setState({ contact });
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  loadContactProfile = async () => {
+    try {
+      const contactProfile = await this.props.httpClient.get(
+        `/api/v1/external_integration/${this.props.selector}/contact_profile`
+      );
+      this.setState({
+        contactProfile,
+        contactProfileValues: Object.assign({}, contactProfile.values),
+        contactProfileTouchedSecrets: {}
+      });
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  updateContactProfileValue = (field, value) => {
+    const contactProfileValues = Object.assign({}, this.state.contactProfileValues, { [field.key]: value });
+    const newState = { contactProfileValues, contactProfileStatus: null };
+    if (field.type === 'secret') {
+      newState.contactProfileTouchedSecrets = Object.assign({}, this.state.contactProfileTouchedSecrets, {
+        [field.key]: true
+      });
+    }
+    this.setState(newState);
+  };
+
+  saveContactProfile = async e => {
+    if (e) {
+      e.preventDefault();
+    }
+    this.setState({ contactProfileStatus: RequestStatus.Getting });
+    const { integration, contactProfileValues = {}, contactProfileTouchedSecrets = {} } = this.state;
+    const contactSchema = get(integration, 'manifest.contact_schema') || [];
+    const values = {};
+    contactSchema.forEach(field => {
+      const value = contactProfileValues[field.key];
+      if (field.type === 'secret') {
+        // a secret set to null means "unchanged" on the server side
+        values[field.key] = contactProfileTouchedSecrets[field.key] ? value : null;
+      } else if (field.type === 'number') {
+        const numericValue = value === '' || value === undefined || value === null ? NaN : Number(value);
+        if (!Number.isNaN(numericValue)) {
+          values[field.key] = numericValue;
+        }
+      } else if (field.type === 'boolean') {
+        values[field.key] = !!value;
+      } else if (value !== undefined && value !== null) {
+        values[field.key] = value;
+      }
+    });
+    try {
+      const contactProfile = await this.props.httpClient.post(
+        `/api/v1/external_integration/${this.props.selector}/contact_profile`,
+        { values }
+      );
+      this.setState({
+        contactProfile,
+        contactProfileValues: Object.assign({}, contactProfile.values),
+        contactProfileTouchedSecrets: {},
+        contactProfileStatus: RequestStatus.Success
+      });
+    } catch (err) {
+      console.error(err);
+      this.setState({ contactProfileStatus: RequestStatus.Error });
+    }
+  };
+
+  clearContactProfile = async () => {
+    this.setState({ contactProfileStatus: RequestStatus.Getting });
+    try {
+      await this.props.httpClient.delete(`/api/v1/external_integration/${this.props.selector}/contact_profile`);
+      this.setState({ contactProfileStatus: null });
+      await this.loadContactProfile();
+    } catch (e) {
+      console.error(e);
+      this.setState({ contactProfileStatus: RequestStatus.Error });
+    }
+  };
+
+  loadCalendarAccount = async (integration = this.state.integration) => {
+    const { selector } = this.props;
+    // the block starts empty: an account of the previously opened integration
+    // must never stay on screen (and be saved) under this one, even when the
+    // request fails
+    this.setState({
+      calendarAccount: null,
+      calendarAccountValues: {},
+      calendarAccountTouchedSecrets: {},
+      calendarDisableConfirming: false
+    });
+    try {
+      const calendarAccount = await this.props.httpClient.get(
+        `/api/v1/external_integration/${selector}/calendar/account`
+      );
+      if (selector !== this.props.selector) {
+        // the user opened another integration meanwhile: stale response
+        return;
+      }
+      this.setState({
+        calendarAccount,
+        calendarAccountValues: this.buildCalendarAccountValues(integration, calendarAccount),
+        calendarAccountTouchedSecrets: {},
+        calendarDisableConfirming: false
+      });
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  // The integration pushes the user's calendars right after they enable it,
+  // then at each of its synchronizations: the block refreshes its calendar
+  // list on calendar.updated (a push already scoped to its audience), without
+  // touching the account values the user may be typing. Before the account is
+  // enabled, the user has no calendar of this integration to list.
+  refreshCalendarAccount = async () => {
+    const { selector } = this.props;
+    if (get(this.state, 'integration.manifest.type') !== 'calendar' || !get(this.state, 'calendarAccount.enabled')) {
+      return;
+    }
+    try {
+      const calendarAccount = await this.props.httpClient.get(
+        `/api/v1/external_integration/${selector}/calendar/account`
+      );
+      if (selector !== this.props.selector) {
+        return;
+      }
+      this.setState({ calendarAccount });
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  updateCalendarAccountValue = (field, value) => {
+    const calendarAccountValues = Object.assign({}, this.state.calendarAccountValues, { [field.key]: value });
+    const newState = { calendarAccountValues, calendarAccountStatus: null };
+    if (field.type === 'secret') {
+      newState.calendarAccountTouchedSecrets = Object.assign({}, this.state.calendarAccountTouchedSecrets, {
+        [field.key]: true
+      });
+    }
+    this.setState(newState);
+  };
+
+  saveCalendarAccount = async e => {
+    if (e) {
+      e.preventDefault();
+    }
+    this.setState({ calendarAccountStatus: RequestStatus.Getting });
+    const { integration, calendarAccountValues = {}, calendarAccountTouchedSecrets = {} } = this.state;
+    const accountSchema = get(integration, 'manifest.account_schema') || [];
+    const config = {};
+    accountSchema.forEach(field => {
+      const value = calendarAccountValues[field.key];
+      if (field.type === 'secret') {
+        // a secret set to null means "unchanged" on the server side
+        config[field.key] = calendarAccountTouchedSecrets[field.key] ? value : null;
+      } else if (field.type === 'number') {
+        const numericValue = value === '' || value === undefined || value === null ? NaN : Number(value);
+        if (!Number.isNaN(numericValue)) {
+          config[field.key] = numericValue;
+        }
+      } else if (field.type === 'boolean') {
+        config[field.key] = !!value;
+      } else if (value !== undefined && value !== null) {
+        config[field.key] = value;
+      }
+    });
+    const { selector } = this.props;
+    try {
+      const calendarAccount = await this.props.httpClient.post(
+        `/api/v1/external_integration/${selector}/calendar/account`,
+        { config }
+      );
+      if (selector !== this.props.selector) {
+        return;
+      }
+      this.setState({
+        calendarAccount,
+        calendarAccountValues: this.buildCalendarAccountValues(integration, calendarAccount),
+        calendarAccountTouchedSecrets: {},
+        calendarAccountStatus: RequestStatus.Success
+      });
+    } catch (err) {
+      console.error(err);
+      this.setState({ calendarAccountStatus: RequestStatus.Error });
+    }
+  };
+
+  armDisableCalendarAccount = () => {
+    // disabling destroys the user's calendars: explicit confirmation first
+    this.setState({ calendarDisableConfirming: true, calendarAccountStatus: null });
+  };
+
+  cancelDisableCalendarAccount = () => {
+    this.setState({ calendarDisableConfirming: false });
+  };
+
+  disableCalendarAccount = async () => {
+    this.setState({ calendarAccountStatus: RequestStatus.Getting });
+    try {
+      await this.props.httpClient.delete(`/api/v1/external_integration/${this.props.selector}/calendar/account`);
+      this.setState({ calendarAccountStatus: null, calendarDisableConfirming: false });
+      await this.loadCalendarAccount();
+    } catch (e) {
+      console.error(e);
+      this.setState({ calendarAccountStatus: RequestStatus.Error });
+    }
+  };
+
+  toggleUserCalendar = async (calendarSelector, key, checked) => {
+    // optimistic toggle, rolled back on failure (the preferLocal pattern),
+    // then reloaded from the server, the authority on the stored value. Both
+    // the patch and the rollback derive from the previous state and touch only
+    // this calendar; the toggles stay disabled while a request is in flight,
+    // so two requests on the same calendar never race.
+    const patch = value => state => ({
+      calendarAccount: Object.assign({}, state.calendarAccount, {
+        calendars: (get(state, 'calendarAccount.calendars') || []).map(calendar =>
+          calendar.selector === calendarSelector ? Object.assign({}, calendar, { [key]: value }) : calendar
+        )
+      })
+    });
+    this.setState(state => Object.assign({ calendarToggleStatus: RequestStatus.Getting }, patch(checked)(state)));
+    try {
+      await this.props.httpClient.patch(
+        `/api/v1/external_integration/${this.props.selector}/calendar/${calendarSelector}`,
+        { [key]: checked }
+      );
+      this.setState({ calendarToggleStatus: RequestStatus.Success });
+    } catch (err) {
+      console.error(err);
+      this.setState(state => Object.assign({ calendarToggleStatus: RequestStatus.Error }, patch(!checked)(state)));
+      await this.refreshCalendarAccount();
+    }
+  };
+
+  loadGatewayStatus = async integration => {
+    // the webhooks block needs to know whether Gladys Plus is linked:
+    // without it, an explanatory message replaces the key input
+    if ((get(integration, 'manifest.webhooks') || []).length === 0) {
+      return;
+    }
+    try {
+      const gatewayStatus = await this.props.httpClient.get('/api/v1/gateway/status');
+      this.setState({ gatewayStatus });
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  updateOpenApiKey = e => {
+    this.setState({ openApiKeyValue: e.target.value, openApiKeyStatus: null });
+  };
+
+  saveOpenApiKey = async () => {
+    this.setState({ openApiKeyStatus: RequestStatus.Getting });
+    try {
+      const configResponse = await this.props.httpClient.post(
+        `/api/v1/external_integration/${this.props.selector}/config`,
+        { config: { GLADYS_OPEN_API_KEY: this.state.openApiKeyValue } }
+      );
+      // the webhook URLs contain the key: refresh the detail to get them
+      const integration = await this.props.httpClient.get(`/api/v1/external_integration/${this.props.selector}`);
+      this.setState({
+        integration,
+        configuredSecrets: configResponse.configured_secrets || [],
+        openApiKeyValue: '',
+        openApiKeyStatus: RequestStatus.Success
+      });
+    } catch (e) {
+      console.error(e);
+      this.setState({ openApiKeyStatus: RequestStatus.Error });
+    }
+  };
+
+  loadDynamicOptions = async (integration, isAdmin, selector) => {
+    // a select/multi_select of the config_schema, of an action mini form or
+    // of a per-user form (contact_schema, account_schema) can take its
+    // options from a core-defined source: the already-created devices of the
+    // integration, or the houses of Gladys. A non-admin only sees the
+    // per-user forms. `selector` is the one loadData started with: the
+    // fields belong to that integration, so a newer integration opened in
+    // the meantime must never receive them, nor their options.
+    if (selector !== this.props.selector) {
+      return;
+    }
+    const perUserFields = (get(integration, 'manifest.contact_schema') || []).concat(
+      get(integration, 'manifest.account_schema') || []
+    );
+    const adminFields = isAdmin
+      ? (get(integration, 'manifest.actions') || []).reduce(
+          (fields, action) => fields.concat(action.fields || []),
+          get(integration, 'manifest.config_schema') || []
+        )
+      : [];
+    const allFields = adminFields.concat(perUserFields);
+    if (!hasDynamicSource(allFields)) {
+      return;
+    }
+    try {
+      const dynamicOptions = await fetchDynamicOptions(this.props.httpClient, selector, allFields);
+      if (selector !== this.props.selector) {
+        // a newer integration has been opened since, discard this stale result
+        return;
+      }
+      this.setState({ dynamicOptions });
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  loadHardwareDetection = async integration => {
+    const requestedClasses = getRequestedHardwareClasses(get(integration, 'manifest.containers') || []);
+    if (requestedClasses.length === 0) {
+      return;
+    }
+    try {
+      const { classes = [] } = await this.props.httpClient.get('/api/v1/external_integration/hardware');
+      const detectedClasses = {};
+      classes.forEach(hardwareClass => {
+        detectedClasses[hardwareClass.class] = hardwareClass.detected;
+      });
+      this.setState({ detectedClasses });
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  generateLinkCode = async () => {
+    this.setState({ linkStatus: RequestStatus.Getting });
+    try {
+      const { code } = await this.props.httpClient.post(
+        `/api/v1/external_integration/${this.props.selector}/link_code`,
+        {}
+      );
+      this.setState({ linkCode: code, linkStatus: RequestStatus.Success });
+    } catch (e) {
+      console.error(e);
+      this.setState({ linkStatus: RequestStatus.Error });
+    }
+  };
+
+  unlinkContact = async () => {
+    this.setState({ linkStatus: RequestStatus.Getting });
+    try {
+      await this.props.httpClient.delete(`/api/v1/external_integration/${this.props.selector}/contact`);
+      this.setState({ linkCode: null, linkStatus: RequestStatus.Success });
+      await this.loadContact();
+    } catch (e) {
+      console.error(e);
+      this.setState({ linkStatus: RequestStatus.Error });
+    }
+  };
+
+  toggleHardwareClass = hardwareClass => {
+    const { grantedDevices = [] } = this.state;
+    this.setState({
+      grantedDevices: grantedDevices.includes(hardwareClass)
+        ? grantedDevices.filter(grantedClass => grantedClass !== hardwareClass)
+        : grantedDevices.concat([hardwareClass]),
+      hardwareStatus: null
+    });
+  };
+
+  saveHardware = async () => {
+    this.setState({ hardwareStatus: RequestStatus.Getting });
+    try {
+      const integration = await this.props.httpClient.post(
+        `/api/v1/external_integration/${this.props.selector}/hardware`,
+        { granted_devices: this.state.grantedDevices || [] }
+      );
+      this.setState({
+        integration,
+        grantedDevices: integration.granted_devices || [],
+        hardwareStatus: RequestStatus.Success
+      });
+    } catch (e) {
+      console.error(e);
+      this.setState({ hardwareStatus: RequestStatus.Error });
+    }
+  };
+
+  updateActionFieldValue = (actionKey, field, value) => {
+    const actionFieldValues = Object.assign({}, this.state.actionFieldValues);
+    actionFieldValues[actionKey] = Object.assign({}, actionFieldValues[actionKey], { [field.key]: value });
+    this.setState({ actionFieldValues });
+  };
+
+  runAction = async action => {
+    const { selector } = this.props;
+    const actionStates = Object.assign({}, this.state.actionStates, {
+      [action.key]: { status: RequestStatus.Getting }
+    });
+    this.setState({ actionStates });
+    const rawValues = (this.state.actionFieldValues || {})[action.key] || {};
+    const fields = {};
+    (action.fields || []).forEach(field => {
+      const value = rawValues[field.key];
+      if (field.type === 'number') {
+        const numericValue = value === '' || value === undefined || value === null ? NaN : Number(value);
+        if (!Number.isNaN(numericValue)) {
+          fields[field.key] = numericValue;
+        }
+      } else if (field.type === 'boolean') {
+        fields[field.key] = !!value;
+      } else if (value !== undefined && value !== null) {
+        fields[field.key] = value;
+      }
+    });
+    try {
+      const result = await this.props.httpClient.post(`/api/v1/external_integration/${selector}/action/${action.key}`, {
+        fields
+      });
+      if (selector !== this.props.selector) {
+        // the page moved to another integration meanwhile, discard this result
+        return;
+      }
+      this.setState({
+        actionStates: Object.assign({}, this.state.actionStates, {
+          [action.key]: { status: RequestStatus.Success, message: result.message }
+        })
+      });
+    } catch (e) {
+      console.error(e);
+      if (selector !== this.props.selector) {
+        return;
+      }
+      // an explicit refusal of the integration is a 422 carrying its message
+      const message = get(e, 'response.data.properties');
+      this.setState({
+        actionStates: Object.assign({}, this.state.actionStates, {
+          [action.key]: { status: RequestStatus.Error, message }
+        })
+      });
+    }
+  };
+
+  togglePreferLocal = async e => {
+    const preferLocal = e.target.checked;
+    // optimistic update, saved immediately (standard core toggle, outside
+    // the manifest config_schema)
+    this.setState({
+      configValues: Object.assign({}, this.state.configValues, { GLADYS_PREFER_LOCAL: preferLocal }),
+      preferLocalStatus: RequestStatus.Getting
+    });
+    try {
+      await this.props.httpClient.post(`/api/v1/external_integration/${this.props.selector}/config`, {
+        config: { GLADYS_PREFER_LOCAL: preferLocal }
+      });
+      this.setState({ preferLocalStatus: RequestStatus.Success });
+    } catch (err) {
+      console.error(err);
+      this.setState({
+        configValues: Object.assign({}, this.state.configValues, { GLADYS_PREFER_LOCAL: !preferLocal }),
+        preferLocalStatus: RequestStatus.Error
+      });
+    }
+  };
+
+  toggleOAuthUseInstanceRedirect = e => {
+    const useInstanceRedirect = e.target.checked;
+    // remembered per browser and per origin, but not per integration: it
+    // describes how this Gladys is reached, which does not change from one
+    // provider to the next (reaching the same instance through Gladys Plus is
+    // another origin, hence another preference — which is what we want, that
+    // one is already HTTPS)
+    localStorage.setItem(OAUTH_USE_INSTANCE_REDIRECT_KEY, useInstanceRedirect ? 'true' : 'false');
+    this.setState({ oauthUseInstanceRedirect: useInstanceRedirect, oauthStatus: null });
+  };
+
+  connectOAuth = async field => {
+    this.setState({ oauthStatus: RequestStatus.Getting, oauthInvalidState: false, oauthInvalidUrl: false });
+    const { selector } = this.props;
+    const callbackPath = getOAuthCallbackPath(selector);
+    // an account_link provider never comes back to Gladys: the user approves it
+    // elsewhere and the integration notices on its own side. There is no
+    // redirect URI to declare, no state to carry across a round trip, and no
+    // callback tab to prime — the URL is opened as it was built. Same predicate
+    // as in ConfigSchemaForm: only `oauth2` is redirect-based, so a future
+    // account field type gets the account_link behaviour on both sides.
+    const usesRedirect = field.type === 'oauth2';
+    // providers refuse a plain HTTP redirect URI, which is how most people
+    // reach their Gladys: the flow goes through the HTTPS redirect page, which
+    // sends the browser back here. Users who already serve Gladys over HTTPS
+    // can opt out and declare their own address at the provider.
+    const useInstanceRedirect = this.state.oauthUseInstanceRedirect && window.location.protocol === 'https:';
+    const redirectUri = useInstanceRedirect ? `${window.location.origin}${callbackPath}` : OAUTH_REDIRECT_URI;
+    try {
+      const { authorize_url: authorizeUrl } = await this.props.httpClient.post(
+        `/api/v1/external_integration/${selector}/oauth/authorize_url`,
+        {
+          key: field.key,
+          redirect_uri: usesRedirect ? redirectUri : undefined
+        }
+      );
+      let urlToOpen = assertOpenableUrl(authorizeUrl);
+      if (usesRedirect) {
+        if (useInstanceRedirect) {
+          // nothing to wrap, the provider comes back here directly, but the
+          // anti-CSRF state stays mandatory
+          getAuthorizeUrlState(authorizeUrl);
+        } else {
+          urlToOpen = wrapAuthorizeUrl(authorizeUrl, { origin: window.location.origin, path: callbackPath });
+        }
+        // the callback popup is a new tab: it recovers the oauth2 key and the
+        // redirect_uri used through localStorage (shared across same-origin
+        // tabs). The token exchange fails unless the exact same redirect_uri
+        // comes back.
+        localStorage.setItem(`externalIntegrationOAuthKey:${selector}`, field.key);
+        localStorage.setItem(`externalIntegrationOAuthRedirectUri:${selector}`, redirectUri);
+      }
+      // An account_link sign-in page is opened with noreferrer: the address of
+      // the instance (often a private LAN one) has no business leaking to a
+      // provider that will never talk to it, and some of them — Xiaomi among
+      // them — reject a sign-in URL opened with a cross-site Referer outright.
+      window.open(urlToOpen, '_blank', usesRedirect ? 'noopener' : 'noopener,noreferrer');
+      this.setState({ oauthStatus: RequestStatus.Success });
+    } catch (e) {
+      console.error(e);
+      this.setState({
+        oauthStatus: RequestStatus.Error,
+        oauthInvalidState: e.message === 'EXTERNAL_INTEGRATION_OAUTH_INVALID_STATE',
+        oauthInvalidUrl: e.message === 'EXTERNAL_INTEGRATION_OAUTH_INVALID_URL'
+      });
+    }
+  };
+
+  onStatusChanged = payload => {
+    if (payload && this.state.integration && payload.selector === this.props.selector) {
+      this.setState({
+        integration: Object.assign({}, this.state.integration, { status: payload.status })
+      });
+    }
+  };
+
+  onConnectionStatusUpdated = payload => {
+    if (payload && this.state.integration && payload.selector === this.props.selector) {
+      this.setState({
+        integration: Object.assign({}, this.state.integration, {
+          connection_status: { connected: payload.connected, message: payload.message }
+        })
+      });
+    }
+  };
+
+  componentWillMount() {
+    this.setState({
+      oauthUseInstanceRedirect: localStorage.getItem(OAUTH_USE_INSTANCE_REDIRECT_KEY) === 'true'
+    });
+    this.props.session.dispatcher.addListener(
+      WEBSOCKET_MESSAGE_TYPES.EXTERNAL_INTEGRATION.STATUS_CHANGED,
+      this.onStatusChanged
+    );
+    this.props.session.dispatcher.addListener(
+      WEBSOCKET_MESSAGE_TYPES.EXTERNAL_INTEGRATION.CONNECTION_STATUS_UPDATED,
+      this.onConnectionStatusUpdated
+    );
+    this.props.session.dispatcher.addListener(WEBSOCKET_MESSAGE_TYPES.CALENDAR.UPDATED, this.refreshCalendarAccount);
+    this.loadData();
+  }
+
+  componentDidUpdate(prevProps) {
+    if (prevProps.selector !== this.props.selector) {
+      this.loadData();
+    }
+  }
+
+  componentWillUnmount() {
+    this.props.session.dispatcher.removeListener(
+      WEBSOCKET_MESSAGE_TYPES.EXTERNAL_INTEGRATION.STATUS_CHANGED,
+      this.onStatusChanged
+    );
+    this.props.session.dispatcher.removeListener(
+      WEBSOCKET_MESSAGE_TYPES.EXTERNAL_INTEGRATION.CONNECTION_STATUS_UPDATED,
+      this.onConnectionStatusUpdated
+    );
+    this.props.session.dispatcher.removeListener(WEBSOCKET_MESSAGE_TYPES.CALENDAR.UPDATED, this.refreshCalendarAccount);
+  }
+
+  render(props, state) {
+    return (
+      <ExternalIntegrationPage selector={props.selector} integration={state.integration}>
+        <ConfigTab
+          {...state}
+          selector={props.selector}
+          user={props.user}
+          httpClient={props.httpClient}
+          updateConfigValue={this.updateConfigValue}
+          saveConfig={this.saveConfig}
+          connectOAuth={this.connectOAuth}
+          toggleOAuthUseInstanceRedirect={this.toggleOAuthUseInstanceRedirect}
+          togglePreferLocal={this.togglePreferLocal}
+          updateActionFieldValue={this.updateActionFieldValue}
+          runAction={this.runAction}
+          generateLinkCode={this.generateLinkCode}
+          unlinkContact={this.unlinkContact}
+          updateOpenApiKey={this.updateOpenApiKey}
+          saveOpenApiKey={this.saveOpenApiKey}
+          updateContactProfileValue={this.updateContactProfileValue}
+          saveContactProfile={this.saveContactProfile}
+          clearContactProfile={this.clearContactProfile}
+          updateCalendarAccountValue={this.updateCalendarAccountValue}
+          saveCalendarAccount={this.saveCalendarAccount}
+          armDisableCalendarAccount={this.armDisableCalendarAccount}
+          cancelDisableCalendarAccount={this.cancelDisableCalendarAccount}
+          disableCalendarAccount={this.disableCalendarAccount}
+          toggleUserCalendar={this.toggleUserCalendar}
+          toggleHardwareClass={this.toggleHardwareClass}
+          saveHardware={this.saveHardware}
+        />
+      </ExternalIntegrationPage>
+    );
+  }
+}
+
+export default connect('user,session,httpClient')(ExternalIntegrationConfigPage);

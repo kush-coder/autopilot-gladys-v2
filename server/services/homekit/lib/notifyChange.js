@@ -1,0 +1,81 @@
+const { EVENTS } = require('../../../utils/constants');
+const logger = require('../../../utils/logger');
+const { mappings } = require('./deviceMappings');
+
+// The alarm of a house is not a device feature, so its changes arrive on the same trigger stream
+// under their own event types. ARMING is left out: it announces the delay before the house actually
+// arms, and the mode has not changed yet when it fires.
+const ALARM_EVENTS = new Set([EVENTS.ALARM.ARM, EVENTS.ALARM.DISARM, EVENTS.ALARM.PARTIAL_ARM, EVENTS.ALARM.PANIC]);
+
+/**
+ * @description Add delay before send new state to Homekit.
+ * @param {object} accessories - HomeKit accessories.
+ * @param {object} event - Gladys event to forward to HomeKit.
+ * @returns {undefined}
+ * @example
+ * notifyChange(accessories, event)
+ */
+function notifyChange(accessories, event) {
+  if (ALARM_EVENTS.has(event.type)) {
+    // No debounce: an alarm arming or going off is exactly what HomeKit must hear about at once.
+    // The promise is caught rather than dropped: this runs from an event listener, where a
+    // rejection would go unhandled.
+    this.sendAlarmState(event.house).catch((e) => {
+      logger.error(`HomeKit: could not forward the alarm state of house ${event.house}: ${e.message}`);
+    });
+
+    return;
+  }
+
+  if (event.type !== EVENTS.DEVICE.NEW_STATE) {
+    return;
+  }
+
+  const feature = this.gladys.stateManager.get('deviceFeature', event.device_feature);
+  const hkAccessory = accessories.find((accessory) => accessory.UUID === feature.device_id);
+  if (!hkAccessory || !mappings[feature.category] || !mappings[feature.category].capabilities[feature.type]) {
+    return;
+  }
+
+  // Nullish and not ||, so that a mapping asking for no delay at all gets it: a smoke alarm and a
+  // button press are both events, and `0 || 5000` would silently push them back to the default
+  // five seconds.
+  const delay = mappings[feature.category].capabilities[feature.type].notifDelay ?? 5000;
+
+  // A zero delay means "no debounce at all", so it must not go through the timeout bookkeeping:
+  // two events in the same tick would clear the first timer and only the second would reach
+  // HomeKit. Send straight away instead.
+  if (delay === 0) {
+    this.sendState(hkAccessory, feature, event);
+
+    return;
+  }
+
+  if (!this.notifyTimeouts[event.device_feature]) {
+    this.notifyTimeouts[event.device_feature] = {
+      timeout: setTimeout(() => {
+        this.sendState(hkAccessory, feature, event);
+      }, delay),
+      startDateTime: new Date().getTime(),
+    };
+
+    return;
+  }
+
+  clearTimeout(this.notifyTimeouts[event.device_feature].timeout);
+
+  const now = new Date().getTime();
+  if (now - this.notifyTimeouts[event.device_feature].startDateTime < 2 * delay) {
+    this.notifyTimeouts[event.device_feature].timeout = setTimeout(() => {
+      this.sendState(hkAccessory, feature, event);
+    }, delay);
+
+    return;
+  }
+
+  this.sendState(hkAccessory, feature, event);
+}
+
+module.exports = {
+  notifyChange,
+};

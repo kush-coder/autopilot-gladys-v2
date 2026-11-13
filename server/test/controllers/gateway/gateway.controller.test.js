@@ -1,0 +1,664 @@
+const nock = require('nock');
+const { expect } = require('chai');
+const sinon = require('sinon').createSandbox();
+const getConfig = require('../../../utils/getConfig');
+const db = require('../../../models');
+const { authenticatedRequest, nonAdminRequest, NON_ADMIN_USER_ID } = require('../request.test');
+const { USER_ROLE, EVENTS } = require('../../../utils/constants');
+
+const config = getConfig();
+
+describe('GET /api/v1/gateway/backup', () => {
+  it('should get backups', async () => {
+    const backups = [
+      {
+        id: '8d43a8f0-09e7-48e9-a619-824a45707c26',
+        account_id: 'f4fd09b6-eeef-4439-95db-ef7a37443757',
+        path: 'http://backup.com',
+        size: 37680,
+        created_at: '2019-06-10T07:01:24.846Z',
+        updated_at: '2019-06-10T07:01:24.846Z',
+        is_deleted: false,
+      },
+    ];
+    nock(config.gladysGatewayServerUrl)
+      .get('/backups')
+      .reply(200, backups);
+    await authenticatedRequest
+      .get('/api/v1/gateway/backup')
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.deep.equal(backups);
+      });
+  });
+});
+
+describe('POST /api/v1/gateway/user/:gateway_user_id/recovery-codes', () => {
+  const GATEWAY_USER_ID = 'a139e4a6-ec6c-442d-9730-0499155d38d4';
+
+  it('should generate the recovery codes of the user from the instance, with the admin password', async () => {
+    const scope = nock(config.gladysGatewayServerUrl)
+      .post(`/instances/users/${GATEWAY_USER_ID}/two-factor/recovery-codes`)
+      .reply(200, { recovery_codes: ['1a2b-3c4d-5e6f-7a8b-9c0d-1e2f-3a4b-5c6d'] });
+    await authenticatedRequest
+      .post(`/api/v1/gateway/user/${GATEWAY_USER_ID}/recovery-codes`)
+      .send({ password: 'mysuperpassword' })
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.deep.equal({ recovery_codes: ['1a2b-3c4d-5e6f-7a8b-9c0d-1e2f-3a4b-5c6d'] });
+      });
+    expect(scope.isDone()).to.equal(true);
+  });
+
+  it('should return 403 and not call Gladys Plus with a wrong password', async () => {
+    const scope = nock(config.gladysGatewayServerUrl)
+      .post(`/instances/users/${GATEWAY_USER_ID}/two-factor/recovery-codes`)
+      .reply(200, { recovery_codes: ['1a2b-3c4d-5e6f-7a8b-9c0d-1e2f-3a4b-5c6d'] });
+    await authenticatedRequest
+      .post(`/api/v1/gateway/user/${GATEWAY_USER_ID}/recovery-codes`)
+      .send({ password: 'wrong-password' })
+      .expect('Content-Type', /json/)
+      .expect(403)
+      .then((res) => {
+        expect(res.body.message).to.equal('WRONG_PASSWORD');
+      });
+    expect(scope.isDone()).to.equal(false);
+    nock.cleanAll();
+  });
+
+  it('should return 403 and not call Gladys Plus without a password', async () => {
+    const scope = nock(config.gladysGatewayServerUrl)
+      .post(`/instances/users/${GATEWAY_USER_ID}/two-factor/recovery-codes`)
+      .reply(200, { recovery_codes: ['1a2b-3c4d-5e6f-7a8b-9c0d-1e2f-3a4b-5c6d'] });
+    await authenticatedRequest
+      .post(`/api/v1/gateway/user/${GATEWAY_USER_ID}/recovery-codes`)
+      .send({})
+      .expect('Content-Type', /json/)
+      .expect(403)
+      .then((res) => {
+        expect(res.body.message).to.equal('WRONG_PASSWORD');
+      });
+    expect(scope.isDone()).to.equal(false);
+    nock.cleanAll();
+  });
+
+  it('should return 500, not WRONG_PASSWORD, when checking the password itself fails', async () => {
+    const scope = nock(config.gladysGatewayServerUrl)
+      .post(`/instances/users/${GATEWAY_USER_ID}/two-factor/recovery-codes`)
+      .reply(200, { recovery_codes: ['1a2b-3c4d-5e6f-7a8b-9c0d-1e2f-3a4b-5c6d'] });
+    // @ts-ignore
+    const originalLogin = global.TEST_GLADYS_INSTANCE.user.login;
+    // @ts-ignore
+    global.TEST_GLADYS_INSTANCE.user.login = async () => {
+      throw new Error('database is down');
+    };
+    try {
+      await authenticatedRequest
+        .post(`/api/v1/gateway/user/${GATEWAY_USER_ID}/recovery-codes`)
+        .send({ password: 'mysuperpassword' })
+        .expect('Content-Type', /json/)
+        .expect(500)
+        .then((res) => {
+          expect(res.body.message).to.not.equal('WRONG_PASSWORD');
+        });
+    } finally {
+      // @ts-ignore
+      global.TEST_GLADYS_INSTANCE.user.login = originalLogin;
+    }
+    expect(scope.isDone()).to.equal(false);
+    nock.cleanAll();
+  });
+
+  it('should return 404 when the user is not in the account of this instance', async () => {
+    nock(config.gladysGatewayServerUrl)
+      .post(`/instances/users/${GATEWAY_USER_ID}/two-factor/recovery-codes`)
+      .reply(404, {});
+    await authenticatedRequest
+      .post(`/api/v1/gateway/user/${GATEWAY_USER_ID}/recovery-codes`)
+      .send({ password: 'mysuperpassword' })
+      .expect('Content-Type', /json/)
+      .expect(404)
+      .then((res) => {
+        expect(res.body.message).to.equal('GATEWAY_USER_NOT_FOUND');
+      });
+  });
+
+  it('should return 403 when two factor is not enabled on the Gladys Plus user', async () => {
+    nock(config.gladysGatewayServerUrl)
+      .post(`/instances/users/${GATEWAY_USER_ID}/two-factor/recovery-codes`)
+      .reply(403, {});
+    await authenticatedRequest
+      .post(`/api/v1/gateway/user/${GATEWAY_USER_ID}/recovery-codes`)
+      .send({ password: 'mysuperpassword' })
+      .expect('Content-Type', /json/)
+      .expect(403)
+      .then((res) => {
+        expect(res.body.message).to.equal('GATEWAY_TWO_FACTOR_NOT_ENABLED');
+      });
+  });
+
+  it('should return 403 and not call Gladys Plus through the Gladys Plus tunnel, even as admin', async () => {
+    const scope = nock(config.gladysGatewayServerUrl)
+      .post(`/instances/users/${GATEWAY_USER_ID}/two-factor/recovery-codes`)
+      .reply(200, { recovery_codes: ['1a2b-3c4d-5e6f-7a8b-9c0d-1e2f-3a4b-5c6d'] });
+    const adminUser = {
+      id: '0cd30aef-9c4e-4a23-88e3-3547971296e5',
+      firstname: 'John',
+      lastname: 'Doe',
+      selector: 'john',
+      email: 'demo@demo.com',
+      language: 'en',
+      role: USER_ROLE.ADMIN,
+    };
+    const response = await new Promise((resolve) => {
+      // @ts-ignore
+      global.TEST_GLADYS_INSTANCE.event.emit(
+        EVENTS.GATEWAY.NEW_MESSAGE_API_CALL,
+        adminUser,
+        'POST',
+        `/api/v1/gateway/user/${GATEWAY_USER_ID}/recovery-codes`,
+        {},
+        { password: 'mysuperpassword' },
+        resolve,
+      );
+    });
+    expect(response).to.have.property('status', 403);
+    expect(response).to.have.property('code', 'FORBIDDEN');
+    expect(scope.isDone()).to.equal(false);
+    nock.cleanAll();
+  });
+
+  it('should return 403 for a non-admin user', async () => {
+    await db.User.create({
+      id: NON_ADMIN_USER_ID,
+      firstname: 'Non',
+      lastname: 'Admin',
+      selector: 'non-admin-recovery-codes',
+      email: 'non-admin-recovery-codes@test.com',
+      password: 'mysuperpassword',
+      role: USER_ROLE.HABITANT,
+      birthdate: '1990-01-01',
+      language: 'en',
+    });
+    try {
+      await nonAdminRequest
+        .post(`/api/v1/gateway/user/${GATEWAY_USER_ID}/recovery-codes`)
+        .send({ password: 'mysuperpassword' })
+        .expect('Content-Type', /json/)
+        .expect(403);
+    } finally {
+      await db.User.destroy({ where: { id: NON_ADMIN_USER_ID } });
+    }
+  });
+});
+
+describe('GET /api/v1/gateway/key', () => {
+  it('should get users keys', async () => {
+    const users = [
+      {
+        id: '9233e553-90a0-4d04-9d69-f38fb8ccbc72',
+        name: 'User 2',
+        rsa_public_key:
+          '51:89:e6:91:4f:da:f8:d6:b6:f6:1e:15:54:c4:c0:fd:cc:69:70:81:d4:a8:ea:26:8b:02:4b:b9:ff:97:64:1a',
+        ecdsa_public_key:
+          '2e:e9:ee:a0:b3:22:46:62:f8:22:9b:52:9d:f4:3f:65:70:62:59:76:d1:85:ad:3b:9f:65:4e:61:4c:26:89:7e',
+        connected: false,
+      },
+    ];
+    nock(config.gladysGatewayServerUrl)
+      .get('/instances/users')
+      .reply(200, users);
+    await authenticatedRequest
+      .get('/api/v1/gateway/key')
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.be.instanceOf(Array);
+        res.body.forEach((user) => {
+          expect(user).to.have.property('accepted');
+        });
+      });
+  });
+});
+
+// The users keys are the list of Gladys Plus users allowed to control the
+// instance remotely. Its read was reserved to admins, but any authenticated
+// user (guests included) could accept, revoke or replace it.
+describe('PATCH /api/v1/gateway/key', () => {
+  const usersKeys = [
+    {
+      id: '9233e553-90a0-4d04-9d69-f38fb8ccbc72',
+      name: 'User 2',
+      rsa_public_key: '51:89:e6:91:4f:da:f8:d6:b6:f6:1e:15:54:c4:c0:fd:cc:69:70:81:d4:a8:ea:26:8b:02:4b:b9:ff:97:64:1a',
+      ecdsa_public_key:
+        '2e:e9:ee:a0:b3:22:46:62:f8:22:9b:52:9d:f4:3f:65:70:62:59:76:d1:85:ad:3b:9f:65:4e:61:4c:26:89:7e',
+      accepted: true,
+    },
+  ];
+  const nonAdminUser = {
+    id: NON_ADMIN_USER_ID,
+    firstname: 'Pepper',
+    lastname: 'Potts',
+    selector: 'pepper-gateway-key',
+    email: 'pepper-gateway-key@pots.com',
+    language: 'en',
+    role: USER_ROLE.HABITANT,
+  };
+  const getStoredUsersKeys = () =>
+    db.Variable.findOne({
+      where: { name: 'GLADYS_GATEWAY_USERS_KEYS', service_id: null, user_id: null },
+    });
+
+  beforeEach(async () => {
+    await db.User.create({ ...nonAdminUser, password: 'mysuperpassword', birthdate: '1990-12-12' });
+  });
+
+  it('should save users keys as an admin', async () => {
+    await authenticatedRequest
+      .patch('/api/v1/gateway/key')
+      .send(usersKeys)
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.deep.equal({ success: true });
+      });
+    const variable = await getStoredUsersKeys();
+    expect(JSON.parse(variable.value)).to.deep.equal(usersKeys);
+  });
+
+  it('should not let a non-admin save users keys', async () => {
+    await nonAdminRequest
+      .patch('/api/v1/gateway/key')
+      .send(usersKeys)
+      .expect('Content-Type', /json/)
+      .expect(403);
+    const variable = await getStoredUsersKeys();
+    expect(variable).to.equal(null);
+  });
+
+  it('should not let a non-admin save users keys through the Gladys Plus gateway', async () => {
+    const response = await new Promise((resolve) => {
+      // @ts-ignore
+      global.TEST_GLADYS_INSTANCE.event.emit(
+        EVENTS.GATEWAY.NEW_MESSAGE_API_CALL,
+        nonAdminUser,
+        'PATCH',
+        '/api/v1/gateway/key',
+        {},
+        usersKeys,
+        resolve,
+      );
+    });
+    expect(response).to.have.property('status', 403);
+    expect(response).to.have.property('code', 'FORBIDDEN');
+    const variable = await getStoredUsersKeys();
+    expect(variable).to.equal(null);
+  });
+});
+
+describe('GET /api/v1/gateway/status', () => {
+  it('should get gateway status', async () => {
+    await authenticatedRequest
+      .get('/api/v1/gateway/status')
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.have.property('connected');
+        expect(res.body).to.have.property('configured');
+        expect(res.body).to.have.property('backup_health');
+        expect(res.body.backup_health).to.have.all.keys(
+          'last_success_at',
+          'failing_since',
+          'last_error',
+          'alert_sent_at',
+        );
+      });
+  });
+  it('should get gateway status as a non-admin user', async () => {
+    // Every user needs to know if the instance is linked to Gladys Plus:
+    // it's what tells the front-end that the AI chat, the voice assistant
+    // and the camera live are available, instead of offering a free trial
+    // for a subscription the instance already has.
+    await db.User.create({
+      id: NON_ADMIN_USER_ID,
+      firstname: 'Pepper',
+      lastname: 'Potts',
+      selector: 'pepper-gateway-status',
+      email: 'pepper-gateway-status@pots.com',
+      password: 'mysuperpassword',
+      role: USER_ROLE.HABITANT,
+      language: 'en',
+      birthdate: '1990-12-12',
+    });
+    try {
+      await nonAdminRequest
+        .get('/api/v1/gateway/status')
+        .expect('Content-Type', /json/)
+        .expect(200)
+        .then((res) => {
+          expect(res.body).to.have.property('connected');
+          expect(res.body).to.have.property('configured');
+          // the health of the backups (server paths in its last error) is for the admins
+          expect(res.body).to.not.have.property('backup_health');
+        });
+    } finally {
+      await db.User.destroy({ where: { id: NON_ADMIN_USER_ID } });
+    }
+  });
+});
+
+describe('POST /api/v1/gateway/logout', () => {
+  it('should disconnect gateway', async () => {
+    await authenticatedRequest
+      .post('/api/v1/gateway/logout')
+      .expect('Content-Type', /json/)
+      .expect(200);
+  });
+});
+
+describe('POST /api/v1/gateway/configure-two-factor', () => {
+  it('should return the otpauth url to configure two factor', async () => {
+    nock(config.gladysGatewayServerUrl)
+      .post('/users/two-factor-configure')
+      .reply(200, {
+        otpauth_url: 'otpauth://totp/Gladys%20Gateway?secret=THISISMYSECRET',
+      });
+    await authenticatedRequest
+      .post('/api/v1/gateway/configure-two-factor')
+      .send({ access_token: 'my-access-token' })
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.deep.equal({
+          otpauth_url: 'otpauth://totp/Gladys%20Gateway?secret=THISISMYSECRET',
+        });
+      });
+  });
+  it('should return 403 when the gateway refuses the access token', async () => {
+    nock(config.gladysGatewayServerUrl)
+      .post('/users/two-factor-configure')
+      .reply(401, {});
+    await authenticatedRequest
+      .post('/api/v1/gateway/configure-two-factor')
+      .send({ access_token: 'my-access-token' })
+      .expect('Content-Type', /json/)
+      .expect(403);
+  });
+});
+
+describe('POST /api/v1/gateway/enable-two-factor', () => {
+  it('should enable two factor', async () => {
+    nock(config.gladysGatewayServerUrl)
+      .post('/users/two-factor-enable', (body) => body.two_factor_code === '123456')
+      .reply(200, {
+        two_factor_enabled: true,
+      });
+    await authenticatedRequest
+      .post('/api/v1/gateway/enable-two-factor')
+      .send({ access_token: 'my-access-token', two_factor_code: '123456' })
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.deep.equal({
+          two_factor_enabled: true,
+        });
+      });
+  });
+  it('should return 403 when the two factor code is invalid', async () => {
+    nock(config.gladysGatewayServerUrl)
+      .post('/users/two-factor-enable')
+      .reply(422, {});
+    await authenticatedRequest
+      .post('/api/v1/gateway/enable-two-factor')
+      .send({ access_token: 'my-access-token', two_factor_code: '000000' })
+      .expect('Content-Type', /json/)
+      .expect(403);
+  });
+});
+
+describe('GET /api/v1/gateway/instance/key', () => {
+  it('should get instance keys', async () => {
+    await authenticatedRequest
+      .get('/api/v1/gateway/instance/key')
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.have.property('rsa_fingerprint');
+        expect(res.body).to.have.property('ecdsa_fingerprint');
+      });
+  });
+});
+
+describe('GET /api/v1/gateway/backup/restore/status', () => {
+  it('should get restore status', async () => {
+    await authenticatedRequest
+      .get('/api/v1/gateway/backup/restore/status')
+      .expect('Content-Type', /json/)
+      .expect(200)
+      .then((res) => {
+        expect(res.body).to.have.property('restore_in_progress');
+      });
+  });
+});
+
+describe('POST /api/v1/gateway/aichat/chat', () => {
+  it('should return AI chat response', async () => {
+    nock(config.gladysGatewayServerUrl)
+      .post('/openai/ask')
+      .reply(200, {
+        choices: [
+          {
+            message: {
+              content: 'this is my answer',
+            },
+          },
+        ],
+      });
+    const response = await authenticatedRequest
+      .post('/api/v1/gateway/aichat/chat')
+      .send({
+        messages: [{ role: 'user', content: 'hello' }],
+        tools: [],
+        tool_choice: 'auto',
+      })
+      .expect('Content-Type', /json/)
+      .expect(200);
+    expect(response.body).to.deep.equal({
+      choices: [
+        {
+          message: {
+            content: 'this is my answer',
+          },
+        },
+      ],
+    });
+  });
+});
+
+describe('POST /api/v1/gateway/aichat/chat (non-admin)', () => {
+  beforeEach(async () => {
+    await db.User.create({
+      id: NON_ADMIN_USER_ID,
+      firstname: 'Pepper',
+      lastname: 'Potts',
+      selector: 'pepper-aichat',
+      email: 'pepper-aichat@pots.com',
+      language: 'en',
+      role: USER_ROLE.HABITANT,
+      password: 'mysuperpassword',
+      birthdate: '1990-12-12',
+    });
+  });
+
+  it('should refuse the raw completion proxy to a non-admin user', async () => {
+    // the debug replay path reaches the selected AI backend with no bound on
+    // the outbound payload: an admin tool, the household chat goes through
+    // message.create
+    await nonAdminRequest
+      .post('/api/v1/gateway/aichat/chat')
+      .send({ messages: [{ role: 'user', content: 'hello' }] })
+      .expect(403);
+  });
+});
+
+describe('GET /api/v1/gateway/aichat/debug-context', () => {
+  beforeEach(() => {
+    global.TEST_GLADYS_INSTANCE.stateManager.setState('service', 'mcp', {
+      mcpHandler: {
+        getAllTools: async () => [],
+      },
+    });
+  });
+
+  it('should return AI chat debug context', async () => {
+    const response = await authenticatedRequest
+      .get('/api/v1/gateway/aichat/debug-context')
+      .expect('Content-Type', /json/)
+      .expect(200);
+
+    expect(response.body).to.have.property('messages');
+    expect(response.body).to.have.property('tools');
+    expect(response.body.tool_choice).to.equal('auto');
+    // eslint-disable-next-line no-underscore-dangle
+    expect(response.body._debug).to.have.property('generatedAt');
+    expect(response.body.messages[0].role).to.equal('system');
+  });
+});
+
+describe('GET /api/v1/gateway/aichat/models', () => {
+  it('should return AI chat models list', async () => {
+    const response = await authenticatedRequest
+      .get('/api/v1/gateway/aichat/models')
+      .expect('Content-Type', /json/)
+      .expect(200);
+
+    expect(response.body).to.have.property('models');
+    expect(response.body.models).to.be.an('array');
+    expect(response.body.models.find((model) => model.id === 'glm-5.2')).to.deep.equal({
+      id: 'glm-5.2',
+      priceLabel: '€€€',
+      priceTier: 3,
+      vision: false,
+    });
+  });
+});
+
+describe('POST /api/v1/gateway/stt', () => {
+  it('should return stt response', async () => {
+    nock(config.gladysGatewayServerUrl)
+      .post('/stt')
+      .reply(200, { text: 'bonjour gladys' });
+    const response = await authenticatedRequest
+      .post('/api/v1/gateway/stt')
+      .set('Content-Type', 'audio/webm')
+      .send(Buffer.from('fake-audio'))
+      .expect('Content-Type', /json/)
+      .expect(200);
+    expect(response.body).to.deep.equal({ text: 'bonjour gladys' });
+  });
+
+  it('should return 400 when audio body is empty', async () => {
+    await authenticatedRequest
+      .post('/api/v1/gateway/stt')
+      .set('Content-Type', 'audio/webm')
+      .send(Buffer.alloc(0))
+      .expect(400);
+  });
+});
+
+describe('POST /api/v1/gateway/voice', () => {
+  beforeEach(() => {
+    global.TEST_GLADYS_INSTANCE.stateManager.setState('service', 'mcp', {
+      mcpHandler: {
+        getAllTools: async () => [],
+      },
+    });
+  });
+
+  it('should process voice message end-to-end', async () => {
+    nock(config.gladysGatewayServerUrl)
+      .post('/stt')
+      .reply(200, { text: 'allume la lumière' });
+    nock(config.gladysGatewayServerUrl)
+      .post('/openai/ask')
+      .reply(200, {
+        choices: [
+          {
+            message: {
+              content: 'La lumière est allumée.',
+            },
+          },
+        ],
+      });
+    nock(config.gladysGatewayServerUrl)
+      .post('/tts/token')
+      .reply(200, { url: 'http://tts.test/audio.mp3' });
+
+    const response = await authenticatedRequest
+      .post('/api/v1/gateway/voice')
+      .set('Content-Type', 'audio/wav')
+      .send(Buffer.from('fake-audio'))
+      .expect('Content-Type', /json/)
+      .expect(200);
+
+    expect(response.body).to.deep.equal({
+      transcription: 'allume la lumière',
+      answer: 'La lumière est allumée.',
+      ttsUrl: 'http://tts.test/audio.mp3',
+    });
+  });
+
+  it('should return 400 when audio body is empty', async () => {
+    await authenticatedRequest
+      .post('/api/v1/gateway/voice')
+      .set('Content-Type', 'audio/webm')
+      .send(Buffer.alloc(0))
+      .expect(400);
+  });
+});
+
+describe('POST /api/v1/gateway/refresh-latest-gladys-version', () => {
+  let isOfficialReleaseImageStub;
+
+  beforeEach(() => {
+    isOfficialReleaseImageStub = sinon.stub(global.TEST_GLADYS_INSTANCE.system, 'isOfficialReleaseImage');
+  });
+
+  afterEach(() => {
+    isOfficialReleaseImageStub.restore();
+    nock.cleanAll();
+  });
+
+  it('should refresh latest gladys version', async () => {
+    isOfficialReleaseImageStub.returns(true);
+    nock(config.gladysGatewayServerUrl)
+      .post('/v1/api/gladys/version', (body) => true)
+      .reply(200, {
+        name: 'v4.56.1',
+        created_at: '2025-03-31T08:17:48.202Z',
+      });
+    const response = await authenticatedRequest
+      .post('/api/v1/gateway/refresh-latest-gladys-version')
+      .expect('Content-Type', /json/)
+      .expect(200);
+    expect(response.body).to.have.property('message', 'Refresh finished');
+  });
+
+  it('should not call Gladys Plus when the instance is not an official release image', async () => {
+    isOfficialReleaseImageStub.returns(false);
+    const gladysPlusCall = nock(config.gladysGatewayServerUrl)
+      .post('/v1/api/gladys/version', (body) => true)
+      .reply(200, {
+        name: 'v4.56.1',
+        created_at: '2025-03-31T08:17:48.202Z',
+      });
+    const response = await authenticatedRequest
+      .post('/api/v1/gateway/refresh-latest-gladys-version')
+      .expect('Content-Type', /json/)
+      .expect(200);
+    expect(response.body).to.have.property('message', 'Refresh finished');
+    expect(gladysPlusCall.isDone()).to.equal(false);
+  });
+});

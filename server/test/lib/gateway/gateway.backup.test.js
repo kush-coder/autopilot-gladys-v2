@@ -1,0 +1,339 @@
+const { expect } = require('chai');
+const sinon = require('sinon').createSandbox();
+const path = require('path');
+const { promises: fsPromises } = require('fs');
+const proxyquire = require('proxyquire').noCallThru();
+
+const GladysGatewayClientMock = require('./GladysGatewayClientMock.test');
+const db = require('../../../models');
+const getConfig = require('../../../utils/getConfig');
+const { NotFoundError, ConflictError } = require('../../../utils/coreErrors');
+const { Error402 } = require('../../../utils/httpErrors');
+
+const { fake, assert } = sinon;
+const Gateway = proxyquire('../../../lib/gateway', {
+  '@gladysassistant/gladys-gateway-js': GladysGatewayClientMock,
+});
+
+describe('gateway.backup', async function describe() {
+  this.timeout(20000);
+
+  const variable = {};
+  const event = {};
+  const user = {};
+  const brain = {};
+  const message = {};
+
+  let gateway;
+
+  beforeEach(async () => {
+    const job = {
+      wrapper: (type, func) => {
+        return async () => {
+          return func();
+        };
+      },
+      updateProgress: fake.resolves({}),
+    };
+
+    variable.getValue = fake.resolves('key');
+    variable.setValue = fake.resolves(null);
+
+    event.on = fake.returns(null);
+    event.emit = fake.returns(null);
+
+    const config = getConfig();
+
+    const scheduler = {
+      scheduleJob: (rule, callback) => {
+        return {
+          callback,
+          rule,
+          cancel: () => {},
+        };
+      },
+    };
+
+    const sequelize = {
+      close: fake.resolves(null),
+    };
+
+    const system = {
+      getInfos: fake.resolves({
+        nodejs_version: 'v10.15.2',
+        gladys_version: 'v4.0.0',
+        is_docker: false,
+      }),
+      isDocker: fake.resolves(true),
+      saveLatestGladysVersion: fake.returns(null),
+      shutdown: fake.resolves(true),
+    };
+
+    user.getByRole = fake.resolves([
+      { language: 'fr', selector: 'toto-fr' },
+      { language: 'en', selector: 'toto-en' },
+    ]);
+
+    message.sendSystemMessage = fake.returns(null);
+    brain.getReply = fake.returns('Backup failed!');
+
+    gateway = new Gateway(variable, event, system, sequelize, config, user, {}, {}, job, scheduler, message, brain);
+    // the health of the backups has its own tests, see gateway.backupHealth.test.js
+    gateway.recordBackupSuccess = fake.resolves(null);
+    gateway.recordBackupFailure = fake.resolves(null);
+  });
+
+  afterEach(() => {
+    sinon.reset();
+  });
+
+  it('should backup gladys', async () => {
+    await gateway.backup();
+
+    assert.calledOnce(gateway.gladysGatewayClient.initializeMultiPartBackup);
+    assert.calledOnce(gateway.gladysGatewayClient.uploadOneBackupChunk);
+    assert.calledOnce(gateway.gladysGatewayClient.finalizeMultiPartBackup);
+    // recorded once the upload is finalized, where nothing can abort it anymore
+    assert.calledOnce(gateway.recordBackupSuccess);
+    assert.calledWith(gateway.recordBackupSuccess, sinon.match.date, gateway.subscriptionLinkGeneration);
+    assert.callOrder(gateway.gladysGatewayClient.finalizeMultiPartBackup, gateway.recordBackupSuccess);
+    assert.notCalled(gateway.gladysGatewayClient.abortMultiPartBackup);
+    assert.notCalled(gateway.recordBackupFailure);
+    expect(gateway.backupInProgress).to.equal(false);
+  });
+
+  it('should cancel the scheduled backup once it succeeded: this one covers the day', async () => {
+    const scheduled = fake.returns(null);
+    const timer = setTimeout(scheduled, 100000);
+    gateway.pendingBackupTimer = timer;
+    const clearTimeoutSpy = sinon.spy(global, 'clearTimeout');
+
+    try {
+      await gateway.backup();
+    } finally {
+      clearTimeoutSpy.restore();
+      clearTimeout(timer);
+    }
+
+    expect(gateway.pendingBackupTimer).to.equal(null);
+    assert.calledWith(clearTimeoutSpy, timer);
+    assert.notCalled(scheduled);
+  });
+
+  it('should leave the scheduled backup armed when it fails: the day still needs one', async () => {
+    gateway.gladysGatewayClient.uploadOneBackupChunk = fake.rejects(new Error('error'));
+    const timer = setTimeout(() => {}, 100000);
+    gateway.pendingBackupTimer = timer;
+
+    try {
+      await gateway.backup();
+      assert.fail();
+    } catch (e) {
+      expect(e).haveOwnProperty('message', 'error');
+    }
+
+    expect(gateway.pendingBackupTimer).to.equal(timer);
+    clearTimeout(timer);
+  });
+
+  it('should refuse to start while another backup is in progress, without touching it', async () => {
+    gateway.backupInProgress = true;
+
+    try {
+      await gateway.backup();
+      assert.fail();
+    } catch (e) {
+      expect(e)
+        .instanceOf(ConflictError)
+        .haveOwnProperty('message', 'BACKUP_ALREADY_IN_PROGRESS');
+    }
+
+    // the running backup is not the one that failed here
+    expect(gateway.backupInProgress).to.equal(true);
+    assert.notCalled(gateway.gladysGatewayClient.initializeMultiPartBackup);
+    assert.notCalled(gateway.recordBackupFailure);
+  });
+
+  it('should be marked in progress while it runs, and not anymore once it failed', async () => {
+    let inProgressDuringUpload;
+    gateway.gladysGatewayClient.uploadOneBackupChunk = sinon.stub().callsFake(async () => {
+      inProgressDuringUpload = gateway.backupInProgress;
+      throw new Error('error');
+    });
+
+    try {
+      await gateway.backup();
+      assert.fail();
+    } catch (e) {
+      expect(e).haveOwnProperty('message', 'error');
+    }
+
+    expect(inProgressDuringUpload).to.equal(true);
+    expect(gateway.backupInProgress).to.equal(false);
+  });
+
+  it('should export the DuckDB backup as Parquet compressed with ZSTD', async () => {
+    // Make sure the exported table has at least one row group to inspect
+    await db.duckDbInsertState('ca91dfdf-55b2-4cf8-a58b-99c0fbf6f5e4', 12, new Date());
+
+    await gateway.backup();
+
+    const backupFiles = await fsPromises.readdir(gateway.config.backupsFolder);
+    const parquetFolder = backupFiles.find((file) => file.includes('_parquet_folder'));
+    expect(parquetFolder).to.not.equal(undefined);
+    const parquetMetadata = await db.duckDbReadConnectionAllAsync(
+      'SELECT DISTINCT compression FROM parquet_metadata(?)',
+      path.join(gateway.config.backupsFolder, parquetFolder, '*.parquet'),
+    );
+    const compressions = parquetMetadata.map((row) => row.compression);
+    expect(compressions.length).to.be.greaterThan(0);
+    expect(compressions.every((compression) => compression === 'ZSTD')).to.equal(true);
+  });
+
+  it('should export DuckDB while the main memory limit is reduced, then restore it', async () => {
+    const getMemoryLimit = async () => {
+      const [row] = await db.duckDbReadConnectionAllAsync("SELECT current_setting('memory_limit') AS memory_limit");
+      return row.memory_limit;
+    };
+    const memoryLimitBefore = await getMemoryLimit();
+    let memoryLimitDuringExport;
+    const steps = [];
+    const runWithReducedMemoryLimit = db.duckDbRunWithReducedMemoryLimit;
+    const createBackupInstance = db.duckDbCreateBackupInstance;
+    const runStub = sinon.stub(db, 'duckDbRunWithReducedMemoryLimit').callsFake(async (task) => {
+      steps.push('reduce');
+      try {
+        return await runWithReducedMemoryLimit(task);
+      } finally {
+        steps.push('restore');
+      }
+    });
+    const createStub = sinon.stub(db, 'duckDbCreateBackupInstance').callsFake(async () => {
+      steps.push('create backup instance');
+      memoryLimitDuringExport = await getMemoryLimit();
+      return createBackupInstance();
+    });
+    try {
+      await gateway.backup();
+    } finally {
+      runStub.restore();
+      createStub.restore();
+    }
+
+    expect(steps).to.deep.equal(['reduce', 'create backup instance', 'restore']);
+    // The limit is lowered only when it is above 512MB, which DuckDB reports as
+    // "488.2 MiB" (it counts 1MB as 1000^2 bytes). The default limit, 30% of the
+    // RAM, is above it on any machine with more than ~1.7GB of RAM.
+    const [value, unit] = memoryLimitBefore.split(' ');
+    const bytesBefore = parseFloat(value) * 1024 ** ['KiB', 'MiB', 'GiB', 'TiB'].indexOf(unit) * 1024;
+    const expectedDuringExport = bytesBefore > 512 * 1000 * 1000 ? '488.2 MiB' : memoryLimitBefore;
+    expect(memoryLimitDuringExport).to.equal(expectedDuringExport);
+    expect(await getMemoryLimit()).to.equal(memoryLimitBefore);
+  });
+
+  it('should start and abort backup', async () => {
+    gateway.gladysGatewayClient.uploadOneBackupChunk = fake.rejects(new Error('error'));
+
+    try {
+      await gateway.backup();
+      assert.fail();
+    } catch (e) {
+      expect(e)
+        .instanceOf(Error)
+        .haveOwnProperty('message', 'error');
+    }
+
+    assert.calledOnce(gateway.gladysGatewayClient.initializeMultiPartBackup);
+    assert.calledOnce(gateway.gladysGatewayClient.abortMultiPartBackup);
+    // the failure is recorded, the admins are warned on the state of the
+    // backups (not on each attempt), and the backup error is the one rethrown
+    assert.calledOnceWithExactly(gateway.recordBackupFailure, 'Error: error', gateway.subscriptionLinkGeneration);
+    assert.notCalled(gateway.recordBackupSuccess);
+  });
+
+  it('should wait for the failure to be recorded before rethrowing the backup error', async () => {
+    const backupError = new Error('upload failed');
+    gateway.gladysGatewayClient.uploadOneBackupChunk = fake.rejects(backupError);
+    let recorded = false;
+    gateway.recordBackupFailure = sinon.stub().callsFake(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 10);
+      });
+      recorded = true;
+    });
+
+    let thrownError;
+    try {
+      await gateway.backup();
+    } catch (e) {
+      thrownError = e;
+    }
+
+    expect(thrownError).to.equal(backupError);
+    expect(recorded).to.equal(true);
+  });
+
+  it('should backup gladys with lots of insert at the same time', async () => {
+    const promisesDevices = [];
+    const promises = [];
+    // create 100 state
+    for (let i = 0; i < 100; i += 1) {
+      promisesDevices.push(
+        db.DeviceFeatureState.create({
+          device_feature_id: 'ca91dfdf-55b2-4cf8-a58b-99c0fbf6f5e4',
+          value: 1,
+        }),
+      );
+      promisesDevices.push(db.duckDbInsertState('ca91dfdf-55b2-4cf8-a58b-99c0fbf6f5e4', 1));
+    }
+    // start backup
+    promises.push(gateway.backup());
+    // create 100 states
+    for (let i = 0; i < 100; i += 1) {
+      promisesDevices.push(
+        db.DeviceFeatureState.create({
+          device_feature_id: 'ca91dfdf-55b2-4cf8-a58b-99c0fbf6f5e4',
+          value: 1,
+        }),
+      );
+      promisesDevices.push(db.duckDbInsertState('ca91dfdf-55b2-4cf8-a58b-99c0fbf6f5e4', 1));
+    }
+    await Promise.all(promisesDevices);
+    await Promise.all(promises);
+    assert.calledOnce(gateway.gladysGatewayClient.initializeMultiPartBackup);
+    assert.calledOnce(gateway.gladysGatewayClient.uploadOneBackupChunk);
+    assert.calledOnce(gateway.gladysGatewayClient.finalizeMultiPartBackup);
+  });
+
+  it('should not backup while the Gladys Plus subscription is not paid', async () => {
+    gateway.subscriptionActive = false;
+
+    try {
+      await gateway.backup();
+      assert.fail();
+    } catch (e) {
+      expect(e).instanceOf(Error402);
+    }
+    assert.notCalled(gateway.gladysGatewayClient.initializeMultiPartBackup);
+    // the admins are already told by the lock itself
+    assert.notCalled(gateway.recordBackupFailure);
+  });
+
+  it('should not backup, no backup key found', async () => {
+    variable.getValue = fake.resolves(null);
+
+    try {
+      await gateway.backup();
+      assert.fail();
+    } catch (e) {
+      expect(e)
+        .instanceOf(NotFoundError)
+        .haveOwnProperty('message', 'GLADYS_GATEWAY_BACKUP_KEY_NOT_FOUND');
+    }
+    assert.calledOnceWithExactly(
+      gateway.recordBackupFailure,
+      'Error: GLADYS_GATEWAY_BACKUP_KEY_NOT_FOUND',
+      gateway.subscriptionLinkGeneration,
+    );
+  });
+});

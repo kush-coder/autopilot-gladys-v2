@@ -1,0 +1,522 @@
+const asyncMiddleware = require('../middlewares/asyncMiddleware');
+
+module.exports = function IntegrationHostController(gladys) {
+  /**
+   * @api {get} /api/integration/v1/status getStatus
+   * @apiName getStatus
+   * @apiGroup IntegrationHostApi
+   * @apiDescription The identity comes from the integration JWT (`/me`
+   * pattern): no integration selector in the URLs, each integration only
+   * sees its own perimeter.
+   * @apiSuccessExample {json} Success-Example
+   * {
+   *   "gladys_version": "v4.82.0",
+   *   "service": { "id": "uuid", "selector": "ext-open-meteo-demo", "status": "RUNNING", "version": "1.2.0" }
+   * }
+   */
+  async function getStatus(req, res) {
+    const service = req.externalIntegrationService;
+    res.json({
+      gladys_version: gladys.system.gladysVersion || null,
+      service: {
+        id: service.id,
+        selector: service.selector,
+        status: service.status,
+        version: service.version,
+      },
+    });
+  }
+
+  /**
+   * @api {post} /api/integration/v1/heartbeat heartbeat
+   * @apiName heartbeat
+   * @apiGroup IntegrationHostApi
+   * @apiDescription HTTP fallback of the WebSocket heartbeat.
+   */
+  async function heartbeat(req, res) {
+    await gladys.externalIntegration.handleHeartbeat(req.externalIntegrationService);
+    res.json({ success: true });
+  }
+
+  /**
+   * @api {post} /api/integration/v1/connection_status saveConnectionStatus
+   * @apiName saveConnectionStatus
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Application-level connection status of the integration
+   * ("connected to Netatmo", "token expired"...), kept in memory, shown in
+   * the Configuration screen and pushed to the frontend. Distinct from the
+   * container state machine.
+   */
+  async function saveConnectionStatus(req, res) {
+    gladys.externalIntegration.setConnectionStatus(req.externalIntegrationService, req.body);
+    res.json({ success: true });
+  }
+
+  /**
+   * @api {post} /api/integration/v1/discovered_device publishDiscoveredDevices
+   * @apiName publishDiscoveredDevices
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Publish the complete list of discovered devices
+   * (replaces the previous one). The integration never creates devices:
+   * creation stays a user gesture in the UI.
+   */
+  async function publishDiscoveredDevices(req, res) {
+    const count = await gladys.externalIntegration.setDiscoveredDevices(
+      req.externalIntegrationService,
+      req.body.devices,
+    );
+    res.json({ success: true, count });
+  }
+
+  /**
+   * @api {get} /api/integration/v1/device getDevices
+   * @apiName getDevices
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Read only: the devices of the integration really
+   * created by the user.
+   */
+  async function getDevices(req, res) {
+    const devices = await gladys.externalIntegration.getDevices(req.externalIntegrationService);
+    res.json(devices);
+  }
+
+  /**
+   * @api {get} /api/integration/v1/house getHouses
+   * @apiName getHouses
+   * @apiGroup IntegrationHostApi
+   * @apiDescription The houses with their coordinates. The home location is
+   * sensitive: only available to integrations declaring `location: true` in
+   * their manifest (shown on the install screen), 403 otherwise. Coordinates
+   * are null when the user has not located the house; the alarm fields are
+   * never returned.
+   * @apiSuccessExample {json} Success-Example
+   * [
+   *   { "id": "uuid", "name": "Home", "selector": "home", "latitude": 48.85, "longitude": 2.35 }
+   * ]
+   */
+  async function getHouses(req, res) {
+    const houses = await gladys.externalIntegration.getHouses(req.externalIntegrationService);
+    res.json(houses);
+  }
+
+  /**
+   * @api {post} /api/integration/v1/state publishStates
+   * @apiName publishStates
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Batch of states, mapped on the native services path
+   * (device.new-state events). Rate limited to 300 states/minute.
+   */
+  async function publishStates(req, res) {
+    gladys.externalIntegration.saveStates(req.externalIntegrationService, req.body.states);
+    res.json({ success: true });
+  }
+
+  /**
+   * @api {post} /api/integration/v1/scene/event publishSceneEvent
+   * @apiName publishSceneEvent
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Fire a scene trigger declared in the manifest
+   * (scene_triggers[].key): the core matches the flat `data` against the
+   * filters configured in the scenes and starts the matching ones,
+   * exposing the declared variables to their actions. 404 on an
+   * undeclared key, 400 on nested data (one primitive per key, 30 keys,
+   * strings of 1000 characters max), 429 past 300 events/minute (a counter
+   * separate from the states). 200 means accepted and evaluated once —
+   * never "a scene ran". A scene event is a trigger, never a state: a
+   * value goes through POST /state, a picture through POST /camera/image.
+   * @apiParamExample {json} Request-Example
+   * { "key": "object_detected", "data": { "camera": "ext:frigate:front", "label": "person", "score": 0.92 } }
+   */
+  async function publishSceneEvent(req, res) {
+    gladys.externalIntegration.publishSceneEvent(req.externalIntegrationService, req.body);
+    res.json({ success: true });
+  }
+
+  /**
+   * @api {post} /api/integration/v1/network_discovery/scan networkDiscoveryScan
+   * @apiName networkDiscoveryScan
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Mediated network discovery: the core captures — and,
+   * for the udp-active-broadcast type, emits the integration-forged
+   * payload as a broadcast and collects the unicast replies — from its
+   * network=host position (bridge containers never receive LAN
+   * broadcasts/mDNS/SSDP, and their own broadcasts never reach the LAN)
+   * and returns the RAW results — the integration interprets them itself.
+   * Bounded to the capture requests declared in the manifest (403
+   * otherwise); an mDNS scan browses every declared mDNS service. Scans
+   * last 1-30s, one at a time per integration; the active
+   * emission is broadcast-only, on a declared port, payload 512 bytes
+   * max, 1 scan per 10 seconds per integration (429 otherwise).
+   */
+  async function networkDiscoveryScan(req, res) {
+    const results = await gladys.externalIntegration.runNetworkDiscoveryScan(req.externalIntegrationService, req.body);
+    res.json(results);
+  }
+
+  /**
+   * @api {post} /api/integration/v1/network/wake networkWake
+   * @apiName networkWake
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Send a Wake-on-LAN magic packet from the Gladys core
+   * network namespace.
+   */
+  async function networkWake(req, res) {
+    await gladys.externalIntegration.wakeOnLan(req.externalIntegrationService, req.body);
+
+    res.json({
+      success: true,
+    });
+  }
+
+  /**
+   * @api {post} /api/integration/v1/camera/image saveCameraImage
+   * @apiName saveCameraImage
+   * @apiGroup IntegrationHostApi
+   * @apiDescription New image of a camera device of the integration
+   * (image/jpg;base64,..., 150 KB max, 12 images/minute per device),
+   * mapped on gladys.device.camera.setImage — the dashboard camera widget
+   * updates in real time. Images never go through POST /state.
+   */
+  async function saveCameraImage(req, res) {
+    const result = await gladys.externalIntegration.saveCameraImage(req.externalIntegrationService, req.body);
+    res.json(result);
+  }
+
+  /**
+   * @api {post} /api/integration/v1/device/transport setDeviceTransports
+   * @apiName setDeviceTransports
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Lightweight batch update of the GLADYS_TRANSPORT* params
+   * (local | cloud | unreachable, plus the optional degraded state:
+   * `degraded` boolean + multi-language `message` reason — an entry
+   * without `degraded` clears the degraded params) without re-publishing
+   * the discovered list; the device badges of the UI update in real time.
+   * Unknown device_external_ids are silently ignored.
+   */
+  async function setDeviceTransports(req, res) {
+    const result = await gladys.externalIntegration.setDeviceTransports(
+      req.externalIntegrationService,
+      req.body.transports,
+    );
+    res.json(result);
+  }
+
+  /**
+   * @api {get} /api/integration/v1/config getConfig
+   * @apiName getConfig
+   * @apiGroup IntegrationHostApi
+   * @apiDescription All the config values, secrets included (this is the
+   * integration, not the frontend).
+   */
+  async function getConfig(req, res) {
+    const config = await gladys.externalIntegration.getIntegrationConfig(req.externalIntegrationService);
+    res.json({ config });
+  }
+
+  /**
+   * @api {post} /api/integration/v1/config saveConfig
+   * @apiName saveConfig
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Partial merge. Keys in the config_schema are validated
+   * against it; keys outside the schema are a free internal storage of the
+   * integration. Never echoed back as config-updated.
+   */
+  async function saveConfig(req, res) {
+    await gladys.externalIntegration.setIntegrationConfig(req.externalIntegrationService, req.body.config);
+    res.json({ success: true });
+  }
+
+  /**
+   * @api {post} /api/integration/v1/message publishMessage
+   * @apiName publishMessage
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Incoming message of a communication integration. The
+   * contact must have linked their Gladys account (link code): unknown
+   * contact -> 404, so the integration can answer "account not linked, code
+   * required" in the channel. A send-only notification channel
+   * (messaging.receive false) gets a 403: it never reaches the brain — the
+   * guarantee is enforced server-side, not only by the manifest.
+   */
+  async function publishMessage(req, res) {
+    const result = await gladys.externalIntegration.handleIncomingMessage(req.externalIntegrationService, req.body);
+    res.json(result);
+  }
+
+  /**
+   * @api {post} /api/integration/v1/contact/link linkContact
+   * @apiName linkContact
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Link an external contact to the Gladys user who
+   * generated the code from the UI (single use, 15 minutes TTL).
+   */
+  async function linkContact(req, res) {
+    const result = await gladys.externalIntegration.linkContact(req.externalIntegrationService, req.body);
+    res.json(result);
+  }
+
+  /**
+   * @api {get} /api/integration/v1/contact getContacts
+   * @apiName getContacts
+   * @apiGroup IntegrationHostApi
+   * @apiDescription The contacts linked to this integration, with the
+   * linked Gladys user.
+   */
+  async function getContacts(req, res) {
+    const contacts = await gladys.externalIntegration.getLinkedContacts(req.externalIntegrationService);
+    res.json(contacts);
+  }
+
+  /**
+   * @api {get} /api/integration/v1/calendar/account getCalendarAccounts
+   * @apiName getCalendarAccounts
+   * @apiGroup IntegrationHostApi
+   * @apiDescription The users who enabled this calendar integration, with
+   * their account values (secrets included: this is the integration side).
+   * Calendar integrations only (403 otherwise).
+   */
+  async function getCalendarAccounts(req, res) {
+    const accounts = await gladys.externalIntegration.getCalendarAccounts(req.externalIntegrationService);
+    res.json(accounts);
+  }
+
+  /**
+   * @api {get} /api/integration/v1/calendar getIntegrationCalendars
+   * @apiName getIntegrationCalendars
+   * @apiGroup IntegrationHostApi
+   * @apiDescription The integration's calendars, with the user-owned sync
+   * flag telling which to skip; ?user=<selector> restricts to one user,
+   * without it every enabled user's calendars come back (startup resync).
+   */
+  async function getIntegrationCalendars(req, res) {
+    const calendars = await gladys.externalIntegration.getIntegrationCalendars(
+      req.externalIntegrationService,
+      req.query.user,
+    );
+    res.json(calendars);
+  }
+
+  /**
+   * @api {post} /api/integration/v1/calendar publishCalendars
+   * @apiName publishCalendars
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Upsert of the calendars of one enabled user, keyed by
+   * external_id (user-scoped prefix enforced). Integration-owned fields
+   * (name, description, color) are overwritten, user-owned ones (sync,
+   * shared, selector) never touched.
+   */
+  async function publishCalendars(req, res) {
+    const result = await gladys.externalIntegration.publishCalendars(req.externalIntegrationService, req.body);
+    res.json(result);
+  }
+
+  /**
+   * @api {delete} /api/integration/v1/calendar deleteIntegrationCalendar
+   * @apiName deleteIntegrationCalendar
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Destroy one of the integration's calendars and its
+   * events (?external_id=...) — how a provider-side deletion propagates.
+   */
+  async function deleteIntegrationCalendar(req, res) {
+    const result = await gladys.externalIntegration.deleteIntegrationCalendar(
+      req.externalIntegrationService,
+      req.query.external_id,
+    );
+    res.json(result);
+  }
+
+  /**
+   * @api {post} /api/integration/v1/calendar/event publishCalendarEvents
+   * @apiName publishCalendarEvents
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Upsert of a batch of events in one of the integration's
+   * calendars, keyed by external_id; with a window ({ from, to }), the
+   * integration's events overlapping the window and absent from the list
+   * are pruned (manually created events never are).
+   */
+  async function publishCalendarEvents(req, res) {
+    const result = await gladys.externalIntegration.publishCalendarEvents(req.externalIntegrationService, req.body);
+    res.json(result);
+  }
+
+  /**
+   * @api {get} /api/integration/v1/webhook getWebhooks
+   * @apiName getWebhooks
+   * @apiGroup IntegrationHostApi
+   * @apiDescription The declared inbound webhooks (Gladys Plus relay) with
+   * their availability and ready-to-register URLs. `available: false`
+   * (Gladys Plus not linked, or Open API key not pasted yet) -> the
+   * integration degrades to poll only. A webhook is a trigger, not a data
+   * source: refresh through the vendor API on reception, never apply the
+   * payload as a state. The webhook-updated WebSocket event signals
+   * availability changes; resync at every reconnection.
+   * @apiSuccessExample {json} Success-Example
+   * {
+   *   "available": true,
+   *   "webhooks": [
+   *     { "key": "events", "mode": "fire_and_forget", "url": "https://api.gladysgateway.com/v1/api/external-integration/xxx/ext-netatmo/events" }
+   *   ]
+   * }
+   */
+  async function getWebhooks(req, res) {
+    const webhooks = await gladys.externalIntegration.getWebhooks(req.externalIntegrationService);
+    res.json(webhooks);
+  }
+
+  /**
+   * @api {get} /api/integration/v1/container getContainers
+   * @apiName getContainers
+   * @apiGroup IntegrationHostApi
+   * @apiDescription The declared sub-containers, their Docker status, the
+   * desired state, the assigned host ports and, per requested hardware
+   * class, the granted/available flags.
+   */
+  async function getContainers(req, res) {
+    const containers = await gladys.externalIntegration.getSubContainersState(req.externalIntegrationService);
+    res.json({ containers });
+  }
+
+  /**
+   * @api {post} /api/integration/v1/container/:name/start startContainer
+   * @apiName startContainer
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Creates the container if needed then starts it (desired
+   * state "running"). The optional env is merged over the manifest env;
+   * when it differs from the existing container, the container is recreated
+   * first (the /data volumes persist).
+   */
+  async function startContainer(req, res) {
+    await gladys.externalIntegration.controlSubContainer(req.externalIntegrationService, req.params.name, 'start', {
+      env: req.body.env,
+    });
+    res.json({ success: true });
+  }
+
+  /**
+   * @api {post} /api/integration/v1/container/:name/stop stopContainer
+   * @apiName stopContainer
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Stops the container and takes it out of the desired
+   * state: the supervisor will not restart it.
+   */
+  async function stopContainer(req, res) {
+    await gladys.externalIntegration.controlSubContainer(req.externalIntegrationService, req.params.name, 'stop');
+    res.json({ success: true });
+  }
+
+  /**
+   * @api {post} /api/integration/v1/container/:name/restart restartContainer
+   * @apiName restartContainer
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Typical use: the integration rewrote a config file of
+   * the sub-container through /data and restarts it to apply.
+   */
+  async function restartContainer(req, res) {
+    await gladys.externalIntegration.controlSubContainer(req.externalIntegrationService, req.params.name, 'restart');
+    res.json({ success: true });
+  }
+
+  /**
+   * @api {post} /api/integration/v1/energy/calendar publishEnergyCalendar
+   * @apiName publishEnergyCalendar
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Upsert the entries of a tariff calendar declared in the manifest
+   * (energy_contracts.calendars[].key, 403 otherwise): at most 2,000 entries per call,
+   * values within the declared enum, starts_at aligned on the granularity, within
+   * 5 years back and 7 days ahead (400 otherwise). Queues a bounded cost recalculation.
+   * @apiParamExample {json} Request-Example
+   * { "calendar_key": "tempo", "entries": [{ "starts_at": "2026-01-11T23:00:00Z", "value": "red" }] }
+   */
+  async function publishEnergyCalendar(req, res) {
+    const result = await gladys.externalIntegration.publishEnergyCalendar(req.externalIntegrationService, req.body);
+    res.json({ success: true, count: result.count, changed_from: result.changed_from });
+  }
+
+  /**
+   * @api {post} /api/integration/v1/energy/consumption publishEnergyConsumption
+   * @apiName publishEnergyConsumption
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Publish dated consumption intervals on a 30-minute or daily consumption
+   * feature of this integration (a supplier whose data arrives after the fact): at most 2,000
+   * intervals per call, starts_at aligned on the 30-minute slot (or the local midnight) of the
+   * Gladys timezone, elapsed and at most 5 years old, kwh finite and positive (400 otherwise);
+   * 404 when the device is not created, 400 on a consumption the core derives from an index.
+   * Upserts the states and queues a bounded cost recalculation of the meter from the earliest
+   * interval whose value changed.
+   * @apiParamExample {json} Request-Example
+   * { "device_feature_external_id": "ext:hq:m:c", "intervals": [{ "starts_at": "2026-01-12T05:00:00Z", "kwh": 0.4 }] }
+   */
+  async function publishEnergyConsumption(req, res) {
+    const result = await gladys.externalIntegration.publishEnergyConsumption(req.externalIntegrationService, req.body);
+    res.json({ success: true, count: result.count, changed_from: result.changed_from });
+  }
+
+  /**
+   * @api {get} /api/integration/v1/energy/calendar/:key getEnergyCalendar
+   * @apiName getEnergyCalendar
+   * @apiGroup IntegrationHostApi
+   * @apiDescription Read back a calendar declared by this integration (from, to, limit).
+   */
+  async function getEnergyCalendar(req, res) {
+    const options = {};
+    ['from', 'to'].forEach((key) => {
+      if (req.query[key]) {
+        options[key] = req.query[key];
+      }
+    });
+    if (req.query.limit) {
+      options.limit = Number(req.query.limit);
+    }
+    const entries = await gladys.externalIntegration.getEnergyCalendar(
+      req.externalIntegrationService,
+      req.params.key,
+      options,
+    );
+    res.json(entries);
+  }
+
+  /**
+   * @api {get} /api/integration/v1/energy/contract getEnergyContracts
+   * @apiName getEnergyContracts
+   * @apiGroup IntegrationHostApi
+   * @apiDescription The users' contracts referencing a template of this integration
+   * (identity, inputs, validity, timezone, currency): never the meter nor the consumption.
+   */
+  async function getEnergyContracts(req, res) {
+    const contracts = await gladys.externalIntegration.getEnergyContracts(req.externalIntegrationService);
+    res.json(contracts);
+  }
+
+  return Object.freeze({
+    getStatus: asyncMiddleware(getStatus),
+    publishEnergyCalendar: asyncMiddleware(publishEnergyCalendar),
+    publishEnergyConsumption: asyncMiddleware(publishEnergyConsumption),
+    getEnergyCalendar: asyncMiddleware(getEnergyCalendar),
+    getEnergyContracts: asyncMiddleware(getEnergyContracts),
+    heartbeat: asyncMiddleware(heartbeat),
+    saveConnectionStatus: asyncMiddleware(saveConnectionStatus),
+    networkDiscoveryScan: asyncMiddleware(networkDiscoveryScan),
+    networkWake: asyncMiddleware(networkWake),
+    saveCameraImage: asyncMiddleware(saveCameraImage),
+    setDeviceTransports: asyncMiddleware(setDeviceTransports),
+    publishDiscoveredDevices: asyncMiddleware(publishDiscoveredDevices),
+    getDevices: asyncMiddleware(getDevices),
+    getHouses: asyncMiddleware(getHouses),
+    publishStates: asyncMiddleware(publishStates),
+    publishSceneEvent: asyncMiddleware(publishSceneEvent),
+    getConfig: asyncMiddleware(getConfig),
+    saveConfig: asyncMiddleware(saveConfig),
+    publishMessage: asyncMiddleware(publishMessage),
+    linkContact: asyncMiddleware(linkContact),
+    getContacts: asyncMiddleware(getContacts),
+    getCalendarAccounts: asyncMiddleware(getCalendarAccounts),
+    getIntegrationCalendars: asyncMiddleware(getIntegrationCalendars),
+    publishCalendars: asyncMiddleware(publishCalendars),
+    deleteIntegrationCalendar: asyncMiddleware(deleteIntegrationCalendar),
+    publishCalendarEvents: asyncMiddleware(publishCalendarEvents),
+    getWebhooks: asyncMiddleware(getWebhooks),
+    getContainers: asyncMiddleware(getContainers),
+    startContainer: asyncMiddleware(startContainer),
+    stopContainer: asyncMiddleware(stopContainer),
+    restartContainer: asyncMiddleware(restartContainer),
+  });
+};

@@ -1,0 +1,244 @@
+import { Text, MarkupText, Localizer } from 'preact-i18n';
+import cx from 'classnames';
+import { RequestStatus, LoginStatus } from '../../utils/consts';
+
+const EXTERNAL_FORGOT_PASSWORD_LINK = 'https://plus.gladysassistant.com/forgot-password';
+
+const GatewayLoginForm = ({ children, ...props }) => (
+  <form
+    onSubmit={
+      !props.gatewayLoginStep2
+        ? props.login
+        : props.gatewayLoginUseRecoveryCode
+        ? props.loginTwoFactorRecoveryCode
+        : props.loginTwoFactor
+    }
+    class="card"
+  >
+    <div class="card-body p-6">
+      <div
+        class={cx('dimmer', {
+          active:
+            props.gatewayLoginStatus === RequestStatus.Getting ||
+            props.gatewayLoginTwoFactorResetStatus === RequestStatus.Getting
+        })}
+      >
+        <div class="loader" />
+        <div class="dimmer-content">
+          <div class="card-title">
+            <Text id="gatewayLogin.cardTitle" />
+          </div>
+          {props.gatewayLoginStatus === LoginStatus.WrongCredentialsError && (
+            <div class="alert alert-danger" role="alert">
+              <Text id="gatewayLogin.wrongCredentials" />
+            </div>
+          )}
+          {props.gatewayLoginStatus === LoginStatus.UnknownError && (
+            <>
+              <div class="alert alert-danger" role="alert">
+                <Text id="gatewayLogin.unknownError" />
+              </div>
+              <div class="alert alert-danger" role="alert">
+                {props.gatewayLoginError}
+              </div>
+            </>
+          )}
+          {props.gatewayLoginStatus === LoginStatus.WrongTwoFactorCodeError && (
+            <div class="alert alert-danger" role="alert">
+              <Text id="gatewayLogin.invalidTwoFactorCode" />
+            </div>
+          )}
+          {props.gatewayLoginStatus === LoginStatus.WrongRecoveryCodeError && (
+            <div class="alert alert-danger" role="alert">
+              <Text id="gatewayLogin.invalidRecoveryCode" />
+            </div>
+          )}
+          {props.gatewayLoginStep2 && props.gatewayTwoFactorJustEnabled && (
+            <div class="alert alert-success" role="alert">
+              <Text id="gatewayLogin.twoFactorEnabledSuccess" />
+            </div>
+          )}
+          {props.gatewayLoginStatus === RequestStatus.GatewayNoInstanceFound && (
+            <div class="alert alert-danger" role="alert">
+              <Text id="gatewayLogin.gatewayNoInstanceFound" />{' '}
+              <a href="/dashboard/settings/billing">
+                <Text id="gatewayLogin.gatewayAccessBilling" />
+              </a>
+            </div>
+          )}
+          {props.gatewayLoginStatus === RequestStatus.NetworkError && (
+            <div class="alert alert-danger" role="alert">
+              <Text id="gatewayLogin.networkError" />
+            </div>
+          )}
+          {props.gatewayLoginStatus === RequestStatus.Error && (
+            <div class="alert alert-danger" role="alert">
+              <Text id="gatewayLogin.unknownError" />
+            </div>
+          )}
+          {props.gatewayLoginTwoFactorResetStatus === RequestStatus.Success && (
+            <div class="alert alert-success" role="alert">
+              <Text id="gatewayLogin.resetTwoFactorEmailSent" />
+            </div>
+          )}
+          {props.gatewayLoginTwoFactorResetStatus === RequestStatus.Error && (
+            <div class="alert alert-danger" role="alert">
+              {props.gatewayLoginTwoFactorResetError === 'INSTANCE_CONNECTED' && (
+                <Text id="gatewayLogin.resetTwoFactorInstanceConnected" />
+              )}
+              {props.gatewayLoginTwoFactorResetError === 'EXPIRED' && <Text id="gatewayLogin.resetTwoFactorExpired" />}
+              {props.gatewayLoginTwoFactorResetError === 'TOO_MANY' && <Text id="gatewayLogin.resetTwoFactorTooMany" />}
+              {props.gatewayLoginTwoFactorResetError === 'UNKNOWN' && <Text id="gatewayLogin.resetTwoFactorError" />}
+            </div>
+          )}
+          {!props.gatewayLoginStep2 && (
+            <div class="form-group">
+              <label class="form-label">
+                <Text id="gatewayLogin.emailLabel" />
+              </label>
+              <Localizer>
+                <input
+                  type="email"
+                  class={cx('form-control', {
+                    'is-invalid': props.gatewayLoginStatus === LoginStatus.WrongEmailError
+                  })}
+                  placeholder={<Text id="gatewayLogin.emailPlaceholder" />}
+                  value={props.gatewayLoginEmail}
+                  onInput={props.updateLoginEmail}
+                />
+              </Localizer>
+              <div class="invalid-feedback">
+                {' '}
+                <Text id="gatewayLogin.invalidEmail" />
+              </div>
+            </div>
+          )}
+          {!props.gatewayLoginStep2 && (
+            <div class="form-group">
+              <label class="form-label">
+                <Text id="gatewayLogin.passwordLabel" />
+              </label>
+              <Localizer>
+                <input
+                  type="password"
+                  class="form-control"
+                  placeholder={<Text id="gatewayLogin.passwordPlaceholder" />}
+                  value={props.gatewayLoginPassword}
+                  onInput={props.updateLoginPassword}
+                />
+              </Localizer>
+            </div>
+          )}
+          {props.gatewayLoginStep2 && !props.gatewayLoginUseRecoveryCode && (
+            <div class="form-group">
+              <label class="form-label">
+                <Text id="gatewayLogin.twoFactorCodeLabel" />
+              </label>
+              <Localizer>
+                <input
+                  type="text"
+                  class={cx('form-control')}
+                  placeholder={<Text id="gatewayLogin.twoFactorCodePlaceholder" />}
+                  value={props.gatewayLoginTwoFactorCode}
+                  onInput={props.updateLoginTwoFactorCode}
+                  inputmode="numeric"
+                  autocomplete="one-time-code"
+                  maxlength="6"
+                  autofocus
+                />
+              </Localizer>
+              <div class="invalid-feedback">
+                {' '}
+                <Text id="gatewayLogin.invalidTwoFactorCode" />
+              </div>
+              <p class="text-muted small mt-2 mb-0">
+                <Text id="gatewayLogin.lostTwoFactor" />{' '}
+                <a href="#" onClick={props.showRecoveryCodeLogin}>
+                  <Text id="gatewayLogin.useRecoveryCodeLink" />
+                </a>
+                <br />
+                <MarkupText id="gatewayLogin.noRecoveryCode" />
+                {props.requestTwoFactorReset && props.gatewayLoginTwoFactorResetStatus !== RequestStatus.Success && (
+                  <span>
+                    {' '}
+                    <a href="#" onClick={props.requestTwoFactorReset}>
+                      <Text id="gatewayLogin.resetTwoFactorLink" />
+                    </a>
+                  </span>
+                )}
+                <br />
+                <MarkupText id="gatewayLogin.twoFactorHelp" />
+              </p>
+            </div>
+          )}
+          {props.gatewayLoginStep2 && props.gatewayLoginUseRecoveryCode && (
+            <div class="form-group">
+              <label class="form-label" htmlFor="gateway-login-recovery-code">
+                <Text id="gatewayLogin.recoveryCodeLabel" />
+              </label>
+              <Localizer>
+                <input
+                  id="gateway-login-recovery-code"
+                  type="text"
+                  class="form-control"
+                  placeholder={<Text id="gatewayLogin.recoveryCodePlaceholder" />}
+                  value={props.gatewayLoginRecoveryCode}
+                  onInput={props.updateLoginRecoveryCode}
+                  autocomplete="off"
+                  autofocus
+                />
+              </Localizer>
+              <p class="text-muted small mt-2 mb-0">
+                <a href="#" onClick={props.showTwoFactorCodeLogin}>
+                  <Text id="gatewayLogin.useTwoFactorCodeLink" />
+                </a>
+                <br />
+                <MarkupText id="gatewayLogin.noRecoveryCode" />
+                {props.requestTwoFactorReset && props.gatewayLoginTwoFactorResetStatus !== RequestStatus.Success && (
+                  <span>
+                    {' '}
+                    <a href="#" onClick={props.requestTwoFactorReset}>
+                      <Text id="gatewayLogin.resetTwoFactorLink" />
+                    </a>
+                  </span>
+                )}
+                <br />
+                <MarkupText id="gatewayLogin.twoFactorHelp" />
+              </p>
+            </div>
+          )}
+          <div class="form-footer">
+            {!props.gatewayLoginStep2 && (
+              <button
+                onClick={props.login}
+                class="btn btn-primary btn-block"
+                disabled={props.gatewayLoginStatus === RequestStatus.Getting}
+              >
+                <Text id="gatewayLogin.loginButtonText" />
+              </button>
+            )}
+            {props.gatewayLoginStep2 && (
+              <button
+                onClick={props.gatewayLoginUseRecoveryCode ? props.loginTwoFactorRecoveryCode : props.loginTwoFactor}
+                class="btn btn-primary btn-block"
+                disabled={props.gatewayLoginStatus === RequestStatus.Getting}
+              >
+                <Text id="gatewayLogin.loginTwoFactorButtonText" />
+              </button>
+            )}
+          </div>
+          {!props.gatewayLoginStep2 && (
+            <a
+              href={props.external_forgot_password ? EXTERNAL_FORGOT_PASSWORD_LINK : '/forgot-password'}
+              class="float-right small mt-2"
+            >
+              <Text id="gatewayLogin.forgotPasswordLabel" />
+            </a>
+          )}
+        </div>
+      </div>
+    </div>
+  </form>
+);
+
+export default GatewayLoginForm;

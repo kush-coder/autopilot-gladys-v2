@@ -1,0 +1,254 @@
+const { expect } = require('chai');
+const chaiAssert = require('chai').assert;
+const sinon = require('sinon').createSandbox();
+const db = require('../../../models');
+
+const { fake, assert } = sinon;
+
+const { EVENTS, WEBSOCKET_MESSAGE_TYPES, JOB_TYPES, JOB_STATUS } = require('../../../utils/constants');
+
+const Job = require('../../../lib/job');
+const { MAX_JOBS_TO_KEEP } = require('../../../lib/job/job.purge');
+
+const event = {
+  emit: fake.returns(null),
+  on: fake.returns(null),
+};
+
+describe('Job', () => {
+  describe('job.create', () => {
+    const job = new Job(event);
+    it('should create a job', async () => {
+      const newJob = await job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      expect(newJob).to.have.property('type', JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      expect(newJob).to.have.property('status', JOB_STATUS.IN_PROGRESS);
+      assert.calledWith(event.emit, EVENTS.WEBSOCKET.SEND_ALL, {
+        type: WEBSOCKET_MESSAGE_TYPES.JOB.NEW,
+        payload: newJob,
+      });
+    });
+    it('should not create a job, invalid type', async () => {
+      const promise = job.start('THIS_JOB_TYPES_DOESNT_EXIST');
+      return chaiAssert.isRejected(promise, 'Validation error: Validation isIn on type failed');
+    });
+    it('should not create a job, invalid data', async () => {
+      const promise = job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP, []);
+      return chaiAssert.isRejected(promise, 'Validation error: "value" must be of type object');
+    });
+  });
+  describe('job.finish', () => {
+    const job = new Job(event);
+    it('should finish a job', async () => {
+      const newJob = await job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      const updatedJob = await job.finish(newJob.id, JOB_STATUS.SUCCESS, {});
+      assert.calledWith(event.emit, EVENTS.WEBSOCKET.SEND_ALL, {
+        type: WEBSOCKET_MESSAGE_TYPES.JOB.UPDATED,
+        payload: updatedJob,
+      });
+    });
+    it('should not finish job, job doesnt exist', async () => {
+      const promise = job.finish('JOB_DOESNT_EXIST', JOB_STATUS.SUCCESS, {});
+      return chaiAssert.isRejected(promise, 'Job not found');
+    });
+    it('should merge finish data with existing job data', async () => {
+      const newJob = await job.start(JOB_TYPES.DEVICE_STATES_PURGE_SINGLE_FEATURE);
+      await job.updateProgress(newJob.id, 10, { duckdb_states_count: 42 });
+      const updatedJob = await job.finish(newJob.id, JOB_STATUS.FAILED, { error: 'something failed' });
+      expect(updatedJob.data).to.deep.equal({
+        duckdb_states_count: 42,
+        error: 'something failed',
+      });
+    });
+  });
+  describe('job.updateProgress', () => {
+    const job = new Job(event);
+    it('should update the progress a job', async () => {
+      const newJob = await job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      const updatedJob = await job.updateProgress(newJob.id, 50);
+      assert.calledWith(event.emit, EVENTS.WEBSOCKET.SEND_ALL, {
+        type: WEBSOCKET_MESSAGE_TYPES.JOB.UPDATED,
+        payload: updatedJob,
+      });
+    });
+    it('should not update the progress a job, invalid progress', async () => {
+      const newJob = await job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      const promise = job.updateProgress(newJob.id, 101);
+      return chaiAssert.isRejected(promise, 'Validation error: Validation max on progress failed');
+    });
+    it('should not update the progress a job, invalid progress', async () => {
+      const newJob = await job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      const promise = job.updateProgress(newJob.id, -1);
+      return chaiAssert.isRejected(promise, 'Validation error: Validation min on progress failed');
+    });
+    it('should attach then merge structured data through dataPatch', async () => {
+      const newJob = await job.start(JOB_TYPES.DEVICE_STATES_PURGE_SINGLE_FEATURE);
+      const firstUpdate = await job.updateProgress(newJob.id, 10, {
+        device_name: 'Test device',
+        duckdb_states_count: 100,
+      });
+      expect(firstUpdate.data).to.deep.equal({
+        device_name: 'Test device',
+        duckdb_states_count: 100,
+      });
+      // A later patch merges with (and can override) the existing data
+      const secondUpdate = await job.updateProgress(newJob.id, 50, { duckdb_states_count: 200 });
+      expect(secondUpdate.data).to.deep.equal({
+        device_name: 'Test device',
+        duckdb_states_count: 200,
+      });
+      expect(secondUpdate).to.have.property('progress', 50);
+    });
+    it('should attach the count of fallback prices to every energy cost job', async () => {
+      const energyCostJobTypes = [
+        JOB_TYPES.ENERGY_MONITORING_COST_CALCULATION_THIRTY_MINUTES,
+        JOB_TYPES.ENERGY_MONITORING_COST_CALCULATION_YESTERDAY,
+        JOB_TYPES.ENERGY_MONITORING_COST_CALCULATION_BEGINNING,
+        JOB_TYPES.ENERGY_MONITORING_COST_CALCULATION_CONTRACT,
+        JOB_TYPES.ENERGY_MONITORING_BILLING_PERIOD_END,
+        JOB_TYPES.ENERGY_MONITORING_DELEGATED_CATCH_UP,
+      ];
+      // eslint-disable-next-line no-restricted-syntax
+      for (const type of energyCostJobTypes) {
+        // eslint-disable-next-line no-await-in-loop
+        const newJob = await job.start(type);
+        // eslint-disable-next-line no-await-in-loop
+        const updated = await job.updateProgress(newJob.id, 100, { fallback_prices_count: 3 });
+        expect(updated.data, type).to.deep.equal({ fallback_prices_count: 3 });
+      }
+      // an energy key, refused on the other job types
+      const backup = await job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      await chaiAssert.isRejected(
+        job.updateProgress(backup.id, 10, { fallback_prices_count: 3 }),
+        '"fallback_prices_count" is not allowed',
+      );
+    });
+    it('should not update job data, invalid dataPatch key', async () => {
+      const newJob = await job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      const promise = job.updateProgress(newJob.id, 10, { not_a_valid_key: true });
+      return chaiAssert.isRejected(promise, '"not_a_valid_key" is not allowed');
+    });
+    it('should not update job data, dataPatch key owned by another job type', async () => {
+      // duckdb_states_count belongs to the purge jobs schema, not to the backup one
+      const newJob = await job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      const promise = job.updateProgress(newJob.id, 10, { duckdb_states_count: 42 });
+      return chaiAssert.isRejected(promise, '"duckdb_states_count" is not allowed');
+    });
+    it('should not update job data, step owned by another purge type', async () => {
+      // "counting" is a step of the per-feature purge, not of the orphaned purge
+      const newJob = await job.start(JOB_TYPES.DEVICE_STATES_PURGE_ORPHANED_DUCKDB_STATES);
+      const promise = job.updateProgress(newJob.id, 10, { step: 'counting' });
+      return chaiAssert.isRejected(promise, '"step" must be [deleting_states]');
+    });
+    it('should not update progress, job doesnt exist', async () => {
+      const promise = job.updateProgress('JOB_DOESNT_EXIST', 10, { duckdb_states_count: 1 });
+      return chaiAssert.isRejected(promise, 'Job not found');
+    });
+  });
+  describe('job.get', () => {
+    const job = new Job(event);
+    it('should get all job', async () => {
+      await job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      const jobs = await job.get();
+      expect(jobs).to.be.instanceOf(Array);
+      jobs.forEach((oneJob) => {
+        expect(oneJob).to.have.property('type');
+      });
+    });
+    it('should get gateway backup job only', async () => {
+      await job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      await job.start(JOB_TYPES.VACUUM);
+      const jobs = await job.get({ type: JOB_TYPES.GLADYS_GATEWAY_BACKUP });
+      expect(jobs).to.be.instanceOf(Array);
+      jobs.forEach((oneJob) => {
+        expect(oneJob).to.have.property('type', JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      });
+    });
+    it('should get 0 job', async () => {
+      await job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      const jobs = await job.get({
+        take: 0,
+      });
+      expect(jobs).to.be.instanceOf(Array);
+      expect(jobs).to.have.lengthOf(0);
+    });
+  });
+  describe('job.init', () => {
+    const job = new Job(event);
+    it('should init jobs and mark unfinished jobs as failed', async () => {
+      const jobCreated = await job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      await job.init();
+      const jobs = await job.get();
+      expect(jobs).to.be.instanceOf(Array);
+      const jobsFiltered = jobs
+        .filter((oneJob) => oneJob.id === jobCreated.id)
+        .map((oneJob) => ({ type: oneJob.type, status: oneJob.status, data: oneJob.data }));
+      expect(jobsFiltered).to.deep.equal([
+        {
+          type: 'gladys-gateway-backup',
+          status: 'failed',
+          data: { error_type: 'purged-when-restarted' },
+        },
+      ]);
+    });
+  });
+  describe('job.purge', () => {
+    const job = new Job(event);
+    it('should keep only the most recent jobs', async () => {
+      const now = Date.now();
+      const jobsToCreate = [];
+      for (let i = 0; i < MAX_JOBS_TO_KEEP + 5; i += 1) {
+        jobsToCreate.push({
+          type: JOB_TYPES.GLADYS_GATEWAY_BACKUP,
+          status: JOB_STATUS.SUCCESS,
+          progress: 100,
+          data: {},
+          // job i is i minutes old, so the 5 oldest have i >= MAX_JOBS_TO_KEEP
+          created_at: new Date(now - i * 60 * 1000),
+          updated_at: new Date(now - i * 60 * 1000),
+        });
+      }
+      await db.Job.bulkCreate(jobsToCreate);
+      await job.purge();
+      const remainingJobs = await db.Job.findAll({ attributes: ['created_at'], raw: true });
+      expect(remainingJobs).to.have.lengthOf(MAX_JOBS_TO_KEEP);
+      const oldestKeptDate = new Date(now - (MAX_JOBS_TO_KEEP - 1) * 60 * 1000);
+      remainingJobs.forEach((remainingJob) => {
+        expect(new Date(remainingJob.created_at).getTime()).to.be.at.least(oldestKeptDate.getTime());
+      });
+    });
+    it('should not delete anything when there are fewer jobs than the limit', async () => {
+      await job.start(JOB_TYPES.GLADYS_GATEWAY_BACKUP);
+      const dateInThePast = new Date(new Date().getTime() - 30 * 24 * 60 * 60 * 1000);
+      await db.Job.update({ created_at: dateInThePast }, { where: {} });
+      await job.purge();
+      const jobs = await job.get();
+      expect(jobs).to.have.lengthOf(1);
+    });
+  });
+  describe('job.wrapper', () => {
+    const job = new Job(event);
+    it('should test wrapper', async () => {
+      const wrapped = job.wrapper(JOB_TYPES.GLADYS_GATEWAY_BACKUP, () => {});
+      await wrapped();
+      const jobs = await job.get();
+      expect(jobs).to.be.instanceOf(Array);
+      const lastJob = jobs[0];
+      expect(lastJob).to.have.property('status', JOB_STATUS.SUCCESS);
+    });
+    it('should test wrapper with failed job', async () => {
+      const wrapped = job.wrapper(JOB_TYPES.GLADYS_GATEWAY_BACKUP, () => {
+        throw new Error('failed');
+      });
+      try {
+        await wrapped();
+      } catch (e) {
+        // normal
+      }
+
+      const jobs = await job.get();
+      expect(jobs).to.be.instanceOf(Array);
+      const lastJob = jobs[0];
+      expect(lastJob).to.have.property('status', JOB_STATUS.FAILED);
+    });
+  });
+});

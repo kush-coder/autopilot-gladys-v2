@@ -1,0 +1,137 @@
+# AGENTS.md
+
+## Cursor Cloud specific instructions
+
+Gladys Assistant is a privacy-first smart home platform. The repo has two dev services:
+
+- **server** (`/server`): Node.js + Express REST/WebSocket API on **port 1443**, using SQLite + DuckDB for storage. Started with `nodemon` (hot reload).
+- **front** (`/front`): Preact SPA (via **Vite**) on **port 1444**, API at `http://localhost:1443`.
+
+The root `package.json` orchestrates both via `npm-run-all`.
+
+### Running the app (dev mode)
+
+From the repo root: `npm start` (runs `run-p start-server:dev start-front:dev`). The server listens on `http://localhost:1443` and the front dev server on `http://localhost:1444`. Open the front URL; on a fresh DB it starts the onboarding/signup flow (create first admin account → preferences → house/room → dashboard). The server auto-creates/migrates its SQLite DB (`server/gladys-development.db`) on start, so no manual migration is needed for a fresh dev run.
+
+### Non-obvious caveats
+
+- **Harmless startup errors:** on `npm start` you'll see smart-home device discovery errors (e.g. `SonosDiscoveryError: No players found`) because no physical devices exist in the VM/network. These are expected and do not affect the app.
+- **Service dependencies:** the server has ~38 integration services under `server/services/*`, each with its own `package.json`. `cd server && npm install` runs a `postinstall` (`cli/install_service_dependencies.js`) that installs deps for every service. Set `INSTALL_SERVICES_SILENT_FAIL=true` so a single flaky service install does not abort the whole install.
+- **Native modules** (`sqlite3`, `bcrypt`, `sharp`, USB/bluetooth services) compile from source; they need build tools (`gcc/g++/make/python3`) and `libudev-dev` on the system. DuckDB (`@duckdb/node-api`) ships prebuilt platform binaries and does not compile from source.
+
+## Gladys Plus version check — official release images only
+
+- The latest-version check sent to Gladys Plus also carries usage statistics, so it only runs on **official release images**: `system.isOfficialReleaseImage()` (`server/lib/system/system.isOfficialReleaseImage.js`) requires `NODE_ENV=production` **and** `GLADYS_OFFICIAL_RELEASE_IMAGE=true`. That variable is only set by `docker/Dockerfile.buildx` when `.github/workflows/docker-release-build.yml` passes it as a build arg.
+- **Never set `GLADYS_OFFICIAL_RELEASE_IMAGE`, and never pass it as a build arg** — not in local dev, `docker run -e`, docker-compose, a `.env` file, CI, tests, the pull request or dev image workflows, or a documentation example — even "to test like in production". Otherwise a non-production instance counts as a real installation and pollutes the statistics.
+- It is expected that the dev server, Cypress and pull request / dev images never call Gladys Plus for the version check (the "new version available" info stays empty there). To test code around the version check, stub `system.isOfficialReleaseImage()` (see `server/test/lib/gateway/gateway.getLatestGladysVersion.test.js`).
+
+## Feature specs (spec-first process)
+
+Living specifications live in `docs/specs/`. They are the source of truth for the behavior and cross-repo contracts of the features they cover.
+
+**When to go spec-first:** large projects and anything touching the data model — write and challenge the spec before the code, and fold field feedback into the spec before implementing it. Small, isolated changes do not need a spec written first.
+
+**Keeping existing specs truthful:** when an area is already covered by a living spec, any PR that changes its behavior or contracts must update the spec **in the same diff**, whatever the size of the change — otherwise the spec drifts and stops being the source of truth.
+
+- **External integrations** (`docs/specs/external-integrations/`, entry point `README.md`): supervisor, host API, integration WebSocket protocol, manifest, store formats, SDK contract. The spec is a folder of topic files — `core/` (the framework), `contracts/` (the v1 contracts, C.1–C.8), `capabilities/` (one self-contained file per integration type or capability: communication, network discovery, Gladys Plus webhooks, weather) — and the folder listing is its index. Any PR that changes a behavior or contract of external integrations must update the file that owns it **in the same diff**. A **new integration type or capability is a new file `capabilities/<topic>.md`** that owns its whole design and its contracts (manifest field, endpoints, WebSocket messages, SDK methods): never rows appended to the shared `contracts/` tables, never a per-file map in the README, never a renumbering — historic section identifiers (B.x, C.x) stay in the headings that have one, and no new one is allocated. Implement from the spec, not from scratch.
+- **Device feature categories & types** (`docs/specs/device-feature-categories.md`): design and review criteria for `DEVICE_FEATURE_CATEGORIES` / `DEVICE_FEATURE_TYPES` in `server/utils/constants.js`. Categories must describe capabilities (never brands), group protocols together, and use mature standards (Matter first, then Zigbee) as the default reference — divergence and standard-free categories are allowed with justification. Any PR — and any PR review — that adds or changes device categories/types must be checked against this spec's checklist.
+- **Dashboard flexible layout & wall-panel widgets** (`docs/specs/dashboard-flexible-layout-and-widgets.md`): the section-based `boxes` shape and its lazy normalization, the chips / house-view / scene-subtitle box contracts, dashboard assets, per-dashboard appearance and the Horizon glass theme. Any PR that changes one of these behaviors or contracts must update this spec **in the same diff**; new device-referencing box fields must also land in `device-migration.md` B.3 and `device.migrate` in the same diff.
+- **Camera enable / disable** (`docs/specs/camera-enable-disable.md`): the `camera`/`enabled` device feature — the "private mode" gate that stops polling, live streaming and image serving for one camera without deleting it. Any PR that changes that behavior (core gates, `rtsp-camera` handling, camera widget placeholder) must update the spec in the same diff.
+- **Water heater** (`docs/specs/water-heater.md`): the `water-heater` device feature category — its six types, the `WATER_HEATER_MODE` enum, how per-appliance mode subsets are declared through `supported_options`, the frontend registration points and the external-integration contract. Designed under `device-feature-categories.md`, whose checklist it answers in its section D. Its section C lists what is deliberately out of scope, and any PR that changes those types or their semantics must update the spec in the same diff.
+- **Energy hierarchy** (`docs/specs/energy-hierarchy.md`): the `energy_parent_id` links between energy features — derived links (index → consumption → cost) and the attachment of a device to an electric meter — are maintained by the core (no cycle, a contract meter is always a root, derived links never edited by the user, repair at start-up); the user only picks which meter a device is on (`PATCH /api/v1/device/:device_selector/electric_meter`). Any PR that changes one of these rules, the main meter feature, the energy monitoring "My devices" page or the energy derivation of an integration must update this spec in the same diff.
+- **Energy contracts** (`docs/specs/energy-contracts.md`): the `t_energy_contract` object, the declarative tariff definition (`tariff_version: 1`, components / rules / conditions / calendars), the rule-based pricing engine (`server/lib/energy-contract/engine.js`) and the `energyContract` manager (`server/lib/energy-contract/index.js`), the tariff calendars, the `energy-monitoring` jobs, the `energy_contract` REST API, the Contracts UI (`front/src/routes/integration/all/energy-monitoring/contracts/`), the `energy-price` widget, the scene trigger / condition and the migration from `t_energy_price`. Its external-integration side (the `energy_contracts` capability: manifest field, host API, WebSocket messages, SDK) is `docs/specs/external-integrations/capabilities/energy-contracts.md`. Any PR that changes the tariff grammar, the engine semantics or one of these contracts must update the owning file **in the same diff**; the JSON schema `tariff.schema.json` and its Joi mirror move together.
+- **Gladys Plus two-factor recovery** (`docs/specs/gladys-plus-recovery-codes-from-instance.md`): how a Gladys Plus user who lost their two-factor app and their recovery codes gets back in without a human — an admin generates new recovery codes from the Users page of the instance, in local mode only (the instance stands in for the second factor), or, when no instance of the account is connected to the Gateway, the user resets their two-factor authentication by email, immediately; a recovery code also replaces the current code when the user changes their two-factor app. Owns the cross-repo contract (Gateway routes under `/instances/users/:user_id/two-factor/` and `/users/two-factor/`, JS client methods, Gladys route and its error messages, the emails, the `/reset-two-factor` page). Any PR that changes one of these behaviors or contracts, in this repo or in the Gateway, must update this spec in the same diff.
+- **Scene time ranges** (`docs/specs/scene-time-ranges.md`): the `time-range` scheduled trigger (its model, the cron jobs at each range boundary and their behaviour across a change of the clocks, the `range_event` / `in_range` / `fired_at` it emits, `resume_on_startup`) and the `condition.in-time-range` condition. Any PR that changes one of these behaviors or contracts must update this spec in the same diff.
+
+## Git workflow (agents)
+
+All changes made by agents must follow this workflow:
+
+1. **Never commit directly to `master`.** Create a feature branch for every change (no matter how small) and open a pull request targeting `master`.
+2. **Write PR titles and descriptions in English**, even when the conversation with the user is in another language. This keeps the project history accessible to all contributors and matches the existing CI, templates, and documentation.
+3. **Create pull requests as ready for review (not draft).** When opening a PR, set `draft: false`. Do not create draft PRs.
+4. **Link the PR to the request it answers when one exists.** If the change answers a community forum topic or a GitHub issue, the PR description should contain it: either `Forum: https://community.gladysassistant.com/t/...` (on its own line, exact format) or `Closes #1234`. This link is strongly recommended: without it the release automations (forum announcement, automatic closing of the topic / issue) cannot run. If the user gave you a forum or issue link, put it in the description; if you do not have one, ask whether one exists, but do not block the PR on it.
+
+## Pull Request requirements (CI)
+
+Every PR to `master` triggers the workflow `.github/workflows/docker-pr-build.yml`. **Run the relevant checks locally before every push** — most first-time CI failures come from skipping them.
+
+### CI jobs overview
+
+| Job | When it runs | What it checks |
+|-----|--------------|----------------|
+| **Front test** | Always | `prettier-check`, `eslint`, `compare-translations` |
+| **Server test** | Always | `prettier-check`, `eslint`, `npm run coverage` + Codecov upload |
+| **Cypress run** | Always | E2E tests (signup, dashboard, integrations…) |
+| **Front build** | When the PR is ready for review (`draft: false`) | `npm run build` (Vite) |
+| **Docker build** | When the PR is ready for review (`draft: false`) | AMD64 Docker image build |
+
+When the PR is ready for review (`draft: false`), the front build and Docker jobs run in CI. Agent PRs should be opened that way, so run the build checks locally before opening the PR.
+
+### Mandatory checklist before push
+
+**Always (any code change):**
+
+1. Run `npm run prettier` (not just `prettier-check`) in every directory you touched, then verify with `npm run prettier-check`.
+2. Run `npm run eslint` in every directory you touched. Use `npm run eslint-fix` (server) if needed.
+
+**If you modified `server/`:**
+
+```bash
+cd server
+npm run prettier && npm run prettier-check
+npm run eslint
+npm run coverage   # runs ~4100 Mocha tests + generates coverage report
+```
+
+- **Every new or changed server file must have tests.** Place tests in `server/test/` mirroring the source structure (e.g. `server/lib/foo/bar.js` → `server/test/lib/foo/bar.test.js`).
+- CI runs `npm run coverage`, not `npm test` alone. Always use `coverage` before pushing.
+- **Codecov must pass** (`fail_ci_if_error: true` in CI). There are two separate checks:
+  - **Project coverage** (~90% on the whole server codebase — see `codecov.yml`). Legacy untested code is tolerated.
+  - **Patch coverage (100%)** — every line you add or modify in the PR must be executed by a test. This is the check that most often fails on agent PRs: one untested line in new code is enough to block the merge.
+- When writing server code, assume **100% patch coverage is required**. If you add a branch, error path, or helper, write a test that hits it.
+- Do not commit test databases (`gladys-test.db`, `gladys-cypress.db`).
+
+**If you modified `front/`:**
+
+```bash
+cd front
+npm run prettier && npm run prettier-check
+npm run eslint
+npm run compare-translations   # required if i18n or device constants changed
+npm run build                  # required before opening the PR
+```
+
+- The front has **no unit-test script**. CI validates the front via eslint, `compare-translations`, build, and Cypress.
+- If you changed UI routes or components, run Cypress from the repo root:
+
+```bash
+npm run cypress:run   # starts server + front, then runs E2E specs in front/cypress/
+```
+
+### Common CI failure causes
+
+- **Prettier:** CI uses `prettier-check` (read-only). Run `npm run prettier` locally to auto-fix formatting before pushing.
+- **ESLint:** Server uses Airbnb config with JSDoc requirements on exported functions. Front lints `src/` and `cypress/`.
+- **Missing translations:** `compare-translations` checks that all `front/src/config/i18n/*.json` files share the same keys, and that `server/utils/constants.js` device features (`DEVICE_FEATURE_UNITS`, `DEVICE_FEATURE_CATEGORIES`, `DEVICE_FEATURE_TYPES`) have matching entries in `en.json`. Adding a key to one language file requires adding it to **all** language files.
+- **Codecov patch coverage:** CI uploads the coverage report to Codecov, which measures only the lines changed in your PR. Any new server line not hit by a test fails the `codecov/patch` status. Run `npm run coverage` locally and confirm your tests exercise every branch and path you added before pushing.
+- **Server tests:** Changes to `server/lib/`, `server/api/`, `server/controllers/`, or `server/services/` almost always need corresponding tests. Look at neighboring files in `server/test/` for patterns (Mocha + Chai + Sinon).
+- **Cypress:** UI changes to signup, dashboard, scenes, or integration pages can break E2E specs under `front/cypress/e2e/`.
+- **Front build:** Agent PRs are created as ready for review, so this job runs in CI. Run `npm run build` locally before opening the PR to catch errors early.
+
+### Lint / test / build commands (reference)
+
+Server (run in `/server`):
+
+- Format: `npm run prettier` / `npm run prettier-check`
+- Lint: `npm run eslint` / `npm run eslint-fix`
+- Test: `npm test` (Mocha; ~4100 tests)
+- Coverage (CI command): `npm run coverage`
+
+Front (run in `/front`):
+
+- Format: `npm run prettier` / `npm run prettier-check`
+- Lint: `npm run eslint`
+- Translations: `npm run compare-translations`
+- Build: `npm run build` (production bundle to `front/build`)
+- E2E: `npm run cypress:run` (from `/front`, or `npm run cypress:run` from repo root)

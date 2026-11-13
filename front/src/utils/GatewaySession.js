@@ -1,0 +1,259 @@
+import GladysGatewayClient from '@gladysassistant/gladys-gateway-js';
+import gatewayRequest from '@gladysassistant/gladys-gateway-js/lib/request';
+
+import config from '../config';
+import { Dispatcher } from './Dispatcher';
+import keyValueStore from './keyValueStore';
+import { hasPasswordFields, omitPasswordFields } from './omitPasswordFields';
+
+const GATEWAY_USER_KEY = 'gateway_user';
+const GATEWAY_PROFILE_PICTURE_KEY = 'gateway_profile_picture';
+const GATEWAY_REFRESH_TOKEN_KEY = 'gateway_refresh_token';
+const GATEWAY_ACCESS_TOKEN_KEY = 'gateway_access_id';
+const GATEWAY_DEVICE_ID_KEY = 'gateway_device_id';
+const GATEWAY_SERIALIZED_KEYS_KEY = 'gateway_serialized_keys';
+const GATEWAY_RSA_PUBLIC_KEY_FINGERPRINT = 'gateway_rsa_public_key_fingerprint';
+const GATEWAY_ECDSA_PUBLIC_KEY_FINGERPRINT = 'gateway_ecdsa_public_key_fingerprint';
+const GATEWAY_TWO_FACTOR_ACCESS_TOKEN = 'gateway_two_factor_access_token';
+
+class GatewaySession {
+  constructor() {
+    this.user = null;
+    this.profilePicture = null;
+    this.initialized = false;
+    this.dispatcher = new Dispatcher();
+    this.websocketConnected = false;
+    this.connected = false;
+    this.ready = false;
+    this.gladysGatewayApiUrl = config.gladysGatewayApiUrl;
+    this.gatewayClient = new GladysGatewayClient({
+      serverUrl: config.gladysGatewayApiUrl,
+      cryptoLib: window.crypto
+    });
+  }
+
+  async init() {
+    this.getUser();
+    await this.connect();
+  }
+
+  reset() {
+    this.user = null;
+    this.profilePicture = null;
+    this.initialized = false;
+    keyValueStore.clear();
+  }
+
+  isConnected() {
+    return this.connected;
+  }
+
+  async connect() {
+    let refreshToken = keyValueStore.get(GATEWAY_REFRESH_TOKEN_KEY);
+    let serializedKeys = keyValueStore.get(GATEWAY_SERIALIZED_KEYS_KEY);
+
+    if (refreshToken && serializedKeys) {
+      this.connected = true;
+      await this.gatewayClient.userConnect(refreshToken, serializedKeys, (type, message) => {
+        if (type === 'message') {
+          this.dispatcher.dispatch(message.event, message.data);
+        }
+        if (type === 'websocket.connected' && message.connected) {
+          this.websocketConnected = true;
+          this.dispatcher.dispatch('websocket.connected', { connected: true });
+        }
+        if (type === 'websocket.connected' && !message.connected) {
+          this.websocketConnected = false;
+          this.dispatcher.dispatch('websocket.connected', { connected: false });
+        }
+      });
+      this.ready = true;
+    }
+  }
+
+  getUser() {
+    if (this.user) {
+      return this.user;
+    }
+    const data = keyValueStore.get(GATEWAY_USER_KEY);
+    if (data) {
+      const user = JSON.parse(data);
+      if (hasPasswordFields(user)) {
+        // older versions of the profile page stored the new password here
+        this.saveUser(user);
+      } else {
+        this.user = user;
+      }
+    }
+    return this.user;
+  }
+
+  async getGatewayUser() {
+    return this.gatewayClient.getMyself();
+  }
+
+  // "Email the admins when Gladys is offline" alert of the Gladys Plus account (admin
+  // only on the Gladys Plus side). The client library has no method for it yet, so the
+  // request goes through its request helper (access token of the session, refreshed
+  // on 401).
+  async updateInstanceOfflineAlert({ enabled, delayInMinutes }) {
+    const fields = {};
+    if (enabled !== undefined) {
+      fields.enabled = enabled;
+    }
+    if (delayInMinutes !== undefined) {
+      fields.delay_in_minutes = delayInMinutes;
+    }
+    return gatewayRequest.patch(
+      `${this.gladysGatewayApiUrl}/accounts/instance-offline-alert`,
+      fields,
+      this.gatewayClient
+    );
+  }
+
+  // Invite someone to the Gladys Plus account, for a given Gladys user of the
+  // instance: the Gateway copies `gladys_4_user_id` onto the user created from
+  // the invitation, so they land on the right Gladys user without picking one
+  // (nobody can pick someone else's). The client library's inviteUser only
+  // takes the email and the role, so the request goes through its request
+  // helper (access token of the session, refreshed on 401).
+  async inviteUserForGladysUser({ email, role, gladysUserId }) {
+    return gatewayRequest.post(
+      `${this.gladysGatewayApiUrl}/invitations`,
+      { email, role, gladys_4_user_id: gladysUserId },
+      this.gatewayClient
+    );
+  }
+
+  // Link a user of the Gladys Plus account to a Gladys user of the instance, as an
+  // admin of the account (PATCH /accounts/users/:id), for accounts created before the
+  // linked invitations; null unlinks
+  async linkAccountUserToGladysUser(plusUserId, gladysUserId) {
+    return gatewayRequest.patch(
+      `${this.gladysGatewayApiUrl}/accounts/users/${plusUserId}`,
+      { gladys_4_user_id: gladysUserId },
+      this.gatewayClient
+    );
+  }
+
+  // Same for a pending invitation (PATCH /invitations/:id): the user created from it
+  // is then linked to that Gladys user
+  async linkInvitationToGladysUser(invitationId, gladysUserId) {
+    return gatewayRequest.patch(
+      `${this.gladysGatewayApiUrl}/invitations/${invitationId}`,
+      { gladys_4_user_id: gladysUserId },
+      this.gatewayClient
+    );
+  }
+
+  // Reset the two factor of a user of the Gladys Plus account who lost their
+  // authenticator, as an admin of the account confirming with their OWN current code
+  // (POST /accounts/users/:id/reset-two-factor)
+  async resetAccountUserTwoFactor(plusUserId, twoFactorCode) {
+    return gatewayRequest.post(
+      `${this.gladysGatewayApiUrl}/accounts/users/${plusUserId}/reset-two-factor`,
+      { two_factor_code: twoFactorCode },
+      this.gatewayClient
+    );
+  }
+
+  // Replacing the two-factor app of the Gladys Plus account is a user operation
+  // (user-scoped routes): it is only possible from the Gladys Plus interface, where
+  // the Gladys Plus user is the one logged in. The client library has no method for
+  // it yet, so the requests go through its request helper (access token of the
+  // session, refreshed on 401).
+  async getNewTwoFactorSecret() {
+    return gatewayRequest.get(`${this.gladysGatewayApiUrl}/users/two-factor/new`, this.gatewayClient);
+  }
+
+  // The Gateway only replaces the secret with a valid code from the NEW app (the
+  // secret was registered correctly) and a valid code from the CURRENT app (the
+  // request comes from someone who holds the current second factor), or one of the
+  // single-use recovery codes for a user who lost their current app.
+  async updateTwoFactor({ twoFactorSecret, twoFactorCode, currentTwoFactorCode, currentTwoFactorRecoveryCode }) {
+    return gatewayRequest.patch(
+      `${this.gladysGatewayApiUrl}/users/two-factor`,
+      {
+        two_factor_secret: twoFactorSecret,
+        two_factor_code: twoFactorCode,
+        current_two_factor_code: currentTwoFactorRecoveryCode ? undefined : currentTwoFactorCode,
+        current_two_factor_recovery_code: currentTwoFactorRecoveryCode || undefined
+      },
+      this.gatewayClient
+    );
+  }
+
+  saveLoginInformations(data) {
+    keyValueStore.set(GATEWAY_REFRESH_TOKEN_KEY, data.refreshToken);
+    keyValueStore.set(GATEWAY_ACCESS_TOKEN_KEY, data.accessToken);
+    keyValueStore.set(GATEWAY_DEVICE_ID_KEY, data.deviceId);
+    keyValueStore.set(GATEWAY_SERIALIZED_KEYS_KEY, data.serializedKeys);
+    keyValueStore.set(GATEWAY_RSA_PUBLIC_KEY_FINGERPRINT, data.rsaPublicKeyFingerprint);
+    keyValueStore.set(GATEWAY_ECDSA_PUBLIC_KEY_FINGERPRINT, data.ecdsaPublicKeyFingerprint);
+  }
+
+  // Fingerprints of the keys of this Gladys Plus user, as the "Remote users" list of the
+  // local instance displays them: comparing both is what protects against a man-in-the-middle
+  getKeysFingerprints() {
+    const rsaPublicKey = keyValueStore.get(GATEWAY_RSA_PUBLIC_KEY_FINGERPRINT);
+    const ecdsaPublicKey = keyValueStore.get(GATEWAY_ECDSA_PUBLIC_KEY_FINGERPRINT);
+    if (!rsaPublicKey || !ecdsaPublicKey) {
+      return null;
+    }
+    return { rsaPublicKey, ecdsaPublicKey };
+  }
+
+  getRefreshToken() {
+    if (this.user) {
+      return this.user.refresh_token;
+    }
+    return null;
+  }
+
+  getAccessToken() {
+    if (this.user) {
+      return this.user.access_token;
+    }
+    return null;
+  }
+
+  setAccessToken(accessToken) {
+    const newUser = Object.assign({}, this.user, {
+      access_token: accessToken
+    });
+    this.saveUser(newUser);
+  }
+
+  getProfilePicture() {
+    if (this.profilePicture) {
+      return this.profilePicture;
+    }
+    const data = keyValueStore.get(GATEWAY_PROFILE_PICTURE_KEY);
+    if (data) {
+      this.profilePicture = data;
+    }
+
+    return this.profilePicture;
+  }
+
+  saveUser(user) {
+    const mergedUser = omitPasswordFields(Object.assign({}, this.user, user));
+    this.user = mergedUser;
+    keyValueStore.set(GATEWAY_USER_KEY, JSON.stringify(mergedUser));
+  }
+
+  saveProfilePicture(profilePicture) {
+    this.profilePicture = profilePicture;
+    keyValueStore.set(GATEWAY_PROFILE_PICTURE_KEY, profilePicture);
+  }
+
+  saveTwoFactorAccessToken(token) {
+    keyValueStore.set(GATEWAY_TWO_FACTOR_ACCESS_TOKEN, token);
+  }
+
+  getTwoFactorAccessToken() {
+    return keyValueStore.get(GATEWAY_TWO_FACTOR_ACCESS_TOKEN);
+  }
+}
+
+export { GatewaySession };

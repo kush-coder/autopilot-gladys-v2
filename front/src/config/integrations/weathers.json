@@ -1,0 +1,10 @@
+[
+  {
+    "key": "openWeather",
+    "img": "/assets/integrations/cover/openweather.jpg",
+    "whiteBackground": true,
+    "cloud": true,
+    "deprecated": true,
+    "categories": ["environment"]
+  }
+]

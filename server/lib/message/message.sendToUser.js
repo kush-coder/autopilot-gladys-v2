@@ -1,0 +1,60 @@
+const { EVENTS, WEBSOCKET_MESSAGE_TYPES, MESSAGE_GLADYS_ONLY_SERVICE } = require('../../utils/constants');
+const { NotFoundError } = require('../../utils/coreErrors');
+const logger = require('../../utils/logger');
+const db = require('../../models');
+
+/**
+ * @description Send a message to a user.
+ * @param {string} userSelector - The selector of the user.
+ * @param {string} text - The answer to send.
+ * @param {string} [file] - An optional file sent with the message.
+ * @param {object} [options] - Extra message options.
+ * @param {string} [options.messageType='chat'] - Message display type.
+ * @param {string} [options.service] - Send through this single channel instead of every one, or
+ * MESSAGE_GLADYS_ONLY_SERVICE to keep the message in the Gladys conversation only.
+ * @returns {Promise} Resolve with created message.
+ * @example
+ * sendToUser('tony', 'Bonjour, voici votre bilan.', null, { messageType: 'notification' });
+ */
+async function sendToUser(userSelector, text, file = null, options = {}) {
+  const { messageType = 'chat', service = null } = options;
+  const user = this.state.get('user', userSelector);
+  if (user === null) {
+    // a scene action pointing at a deleted/renamed user selector used to
+    // fail without saying which selector was wrong
+    logger.warn(`Unable to send message: user "${userSelector}" not found.`);
+    throw new NotFoundError(`User ${userSelector} not found`);
+  }
+  // first, we insert the message in database
+  const messageToInsert = {
+    text,
+    file,
+    sender_id: null, // message sent by gladys
+    receiver_id: user.id,
+    message_type: messageType,
+  };
+  const messageCreated = (await db.Message.create(messageToInsert)).get({ plain: true });
+  // send the message through websocket
+  this.event.emit(EVENTS.WEBSOCKET.SEND, {
+    type: WEBSOCKET_MESSAGE_TYPES.MESSAGE.NEW,
+    userId: user.id,
+    payload: messageCreated,
+  });
+  // "Gladys conversation only": the message is in database and on the
+  // websocket, which is all the user asked for. Stop here, before any
+  // external channel is called — installing a messaging integration must
+  // never turn such a message into a notification the user did not want.
+  if (service === MESSAGE_GLADYS_ONLY_SERVICE) {
+    return messageCreated;
+  }
+  // forward to the outbound channels of the user: every service exposing
+  // message.sendToUser resolves its own identity and no-ops when the user
+  // is not linked — the core does not know any channel by name. When a
+  // service is given, only that channel is used.
+  await this.forwardToChannels(user, messageCreated, service);
+  return messageCreated;
+}
+
+module.exports = {
+  sendToUser,
+};

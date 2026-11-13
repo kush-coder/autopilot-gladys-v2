@@ -1,0 +1,342 @@
+const Promise = require('bluebird');
+const { Transaction } = require('sequelize');
+const { BadParameters } = require('../../utils/coreErrors');
+const db = require('../../models');
+const { EVENTS, DEVICE_FEATURE_STATE_COLUMNS, DEVICE_FEATURE_CATEGORIES } = require('../../utils/constants');
+const { buildUniqueSelector } = require('../../utils/addSelector');
+const { resolveEnergyParentId } = require('../../utils/resolveEnergyParentId');
+const { enforceEnergyHierarchy } = require('../../utils/enforceEnergyHierarchy');
+const { getStandardDeviceIncludes } = require('../../utils/deviceQueryIncludes');
+const logger = require('../../utils/logger');
+const { syncFeatureSupportedOptions } = require('./device.syncFeatureSupportedOptions');
+
+const getById = async (id) => {
+  return db.Device.findOne({
+    where: {
+      id,
+    },
+    include: getStandardDeviceIncludes(),
+  });
+};
+
+const getByExternalId = async (externalId) => {
+  return db.Device.findOne({
+    where: {
+      external_id: externalId,
+    },
+    include: getStandardDeviceIncludes(),
+  });
+};
+
+const getDeviceInDb = async (device) => {
+  if (device.id) {
+    const deviceById = await getById(device.id);
+    if (deviceById) {
+      return deviceById;
+    }
+  }
+  const deviceByExternalId = await getByExternalId(device.external_id);
+  return deviceByExternalId;
+};
+
+const matchFeatureInList = (existingFeature, features) => {
+  // We are matching on both external_id and id, so we can match a device that changed external_id but kept the same id
+  return features.find(
+    (newFeature) => newFeature.id === existingFeature.id || newFeature.external_id === existingFeature.external_id,
+  );
+};
+
+const matchParamInList = (existingParam, params) => {
+  // We are matching on both name & id, so we can match a param that changed name but kept the same id
+  return params.find((newParam) => newParam.id === existingParam.id || newParam.name === existingParam.name);
+};
+
+/**
+ * @description Create a device, its feature and params.
+ * @param {object} device - The device object to create.
+ * @returns {Promise} Resolve with the device created.
+ * @example
+ * gladys.device.create({
+ *  service_id: '90946a0d-5be2-4740-ac8b-26a2d78f12dd',
+ *  name: 'Philips Hue Lamp 1',
+ *  external_id: 'philips-hue:1'
+ *  features: [{
+ *    name: 'On/Off',
+ *    external_id: 'philips-hue:1:binary',
+ *    category: 'light',
+ *    type: 'binary',
+ *    read_only: false,
+ *    keep_history: true,
+ *    has_feedback: false,
+ *    min: 0,
+ *    max: 1
+ *  }],
+ *  params: [{
+ *    name: 'IP_ADDRESS',
+ *    value: '192.168.1.1'
+ *  }]
+ * });
+ */
+async function create(device) {
+  // separate object
+  const features = device.features || [];
+  const params = device.params || [];
+  delete device.features;
+  delete device.params;
+
+  let actionEvent = EVENTS.DEVICE.CREATE;
+  let oldPollFrequency = null;
+
+  const deviceFeaturesIdsToPurge = [];
+
+  // external_id is a required parameter. It is checked before the transaction
+  // so an invalid request never takes the SQLite write lock.
+  if (!device.external_id) {
+    throw new BadParameters('A device must have an external_id.');
+  }
+
+  // we execute the whole insert in a transaction to avoid inconsistent state.
+  // The transaction is IMMEDIATE so the SQLite write lock is taken at BEGIN (where the
+  // SQLITE_BUSY retry can wait for it) instead of failing when a deferred transaction
+  // tries to upgrade its lock at the INSERT while another connection is writing.
+  await db.sequelize.transaction({ type: Transaction.TYPES.IMMEDIATE }, async (transaction) => {
+    // first verify that device doesn't already exist
+    let deviceInDb = await getDeviceInDb(device);
+
+    let deviceToReturn = null;
+
+    // if it doesn't exist, we create it
+    if (deviceInDb === null) {
+      // The selector is derived from the name (addSelector hook) and is unique
+      // in DB: two devices sharing a name would collide. The caller does not
+      // choose it (the frontend sends no selector when creating a discovered
+      // device), so the conflict was a dead end for the user.
+      const uniqueSelector = await buildUniqueSelector(db.Device, device.selector || device.name, { transaction });
+      if (uniqueSelector) {
+        device.selector = uniqueSelector;
+      }
+      deviceInDb = await db.Device.create(device, { transaction });
+    } else {
+      actionEvent = EVENTS.DEVICE.UPDATE;
+      oldPollFrequency = deviceInDb.poll_frequency;
+
+      // Remove MQTT subscription to custom MQTT topic
+      const mqttService = this.serviceManager.getService('mqtt');
+      if (mqttService) {
+        mqttService.device.unListenToCustomMqttTopic(deviceInDb);
+      }
+
+      // or update it
+      const deviceToUpdate = { ...device };
+      delete deviceToUpdate.selector;
+      await deviceInDb.update(deviceToUpdate, { transaction });
+
+      // we delete all features which doesn't exist anymore
+      await Promise.map(deviceInDb.features, async (existingFeature, index) => {
+        if (!matchFeatureInList(existingFeature, features)) {
+          await existingFeature.destroy({ transaction });
+        }
+      });
+
+      // we delete all params which doesn't exist anymore
+      await Promise.map(deviceInDb.params, async (existingParam) => {
+        if (!matchParamInList(existingParam, params)) {
+          await existingParam.destroy({ transaction });
+        }
+      });
+    }
+
+    deviceToReturn = deviceInDb.get({ plain: true });
+    deviceToReturn.features = deviceToReturn.features || [];
+    deviceToReturn.params = deviceToReturn.params || [];
+
+    const energyParentIdByExternalId = new Map();
+    const featuresToSave = features.map((feature) => {
+      if (Object.prototype.hasOwnProperty.call(feature, 'energy_parent_id')) {
+        energyParentIdByExternalId.set(feature.external_id, feature.energy_parent_id);
+      }
+      const featureToSave = { ...feature };
+      delete featureToSave.energy_parent_id;
+      delete featureToSave.supported_options;
+      // The whole music category is live (capabilities/music.md, section 2): no state history
+      // whatever the integration published or the user chose, the exception text features
+      // already have. An existing history is purged below like any feature switched off.
+      if (featureToSave.category === DEVICE_FEATURE_CATEGORIES.MUSIC) {
+        featureToSave.keep_history = false;
+      }
+      return featureToSave;
+    });
+
+    // Feature selectors are unique in DB too, and feature names collide even
+    // more easily than device names (a "Volume" on each speaker published by
+    // the same integration). They are resolved before the insert pass, one at
+    // a time: two features of the same batch must not pick the same candidate,
+    // and the pass below runs them concurrently.
+    const featureSelectorsTaken = new Set();
+    await Promise.each(featuresToSave, async (feature) => {
+      if (matchFeatureInList(feature, deviceToReturn.features)) {
+        return;
+      }
+      const uniqueSelector = await buildUniqueSelector(db.DeviceFeature, feature.selector || feature.name, {
+        transaction,
+        taken: featureSelectorsTaken,
+      });
+      if (uniqueSelector) {
+        feature.selector = uniqueSelector;
+      }
+    });
+
+    // Save features first without energy_parent_id, then resolve parent links in a second pass
+    const newFeatures = await Promise.map(featuresToSave, async (feature) => {
+      try {
+        // if the device feature already exist
+        const matchedFeature = matchFeatureInList(feature, deviceToReturn.features);
+        if (matchedFeature) {
+          const deviceFeature = await db.DeviceFeature.findOne({
+            where: {
+              id: matchedFeature.id,
+            },
+          });
+          // The purge below is a background JOB: a t_job row, several DuckDB &
+          // SQLite counts and their websocket broadcasts, per feature. It is only
+          // worth running when the feature JUST stopped keeping history. A feature
+          // already saved with keep_history = false has nothing left to purge
+          // (device.saveState / device.saveHistoricalState never write a state for
+          // it), so re-purging it on every save was pure background load: a user
+          // assigning a room to one device after another queued one such job per
+          // keep_history = false feature per save, and those jobs pile up behind the
+          // single DuckDB connection until the whole instance stops responding.
+          const keepHistoryBeforeUpdate = deviceFeature.keep_history;
+          const featureToUpdate = { ...feature };
+          delete featureToUpdate.selector;
+          // A save never writes the states of an existing feature (see DEVICE_FEATURE_STATE_COLUMNS)
+          DEVICE_FEATURE_STATE_COLUMNS.forEach((column) => {
+            delete featureToUpdate[column];
+          });
+          await deviceFeature.update(featureToUpdate, { transaction });
+          if (keepHistoryBeforeUpdate !== false && deviceFeature.keep_history === false) {
+            deviceFeaturesIdsToPurge.push(deviceFeature.id);
+          }
+          return deviceFeature.get({ plain: true });
+        }
+        // if not, we create it
+        feature.device_id = deviceToReturn.id;
+        const featureCreated = await db.DeviceFeature.create(feature, { transaction });
+        return featureCreated.get({ plain: true });
+      } catch (e) {
+        // A device can publish dozens of features: "min cannot be null" alone is
+        // not actionable. We tag the error with the identity of the rejected
+        // feature, so the API (and the Discovery screen) can name it. The
+        // context stays structured: the wording is the frontend's job, it must
+        // be translated like the rest of the UI.
+        e.gladysContext = { type: 'device_feature', name: feature.name || feature.external_id || null };
+        throw e;
+      }
+    });
+
+    await Promise.map(newFeatures, async (savedFeature) => {
+      if (!energyParentIdByExternalId.has(savedFeature.external_id)) {
+        return;
+      }
+
+      const requestedParentId = energyParentIdByExternalId.get(savedFeature.external_id);
+      const validParentId = await resolveEnergyParentId(requestedParentId, { transaction });
+
+      if (requestedParentId && !validParentId) {
+        logger.warn(
+          `Invalid energy_parent_id "${requestedParentId}" for feature "${savedFeature.selector}", clearing parent link`,
+        );
+      }
+
+      if (savedFeature.energy_parent_id === validParentId) {
+        return;
+      }
+
+      await db.DeviceFeature.update(
+        { energy_parent_id: validParentId },
+        { where: { id: savedFeature.id }, transaction },
+      );
+      savedFeature.energy_parent_id = validParentId;
+    });
+
+    // whatever the integration sent: no cycle, an electric meter stays a root
+    // (docs/specs/energy-hierarchy.md, section C.1)
+    await enforceEnergyHierarchy(deviceToReturn.id, newFeatures, { transaction });
+
+    deviceToReturn.features = await Promise.map(newFeatures, async (savedFeature) => {
+      const payloadFeature = matchFeatureInList(savedFeature, features);
+      if (!payloadFeature || !Object.prototype.hasOwnProperty.call(payloadFeature, 'supported_options')) {
+        const existingFeature = matchFeatureInList(savedFeature, deviceToReturn.features);
+        savedFeature.supported_options = existingFeature?.supported_options ?? [];
+        return savedFeature;
+      }
+
+      savedFeature.supported_options = await syncFeatureSupportedOptions(
+        savedFeature,
+        payloadFeature.supported_options,
+        transaction,
+      );
+      return savedFeature;
+    });
+
+    const newParams = await Promise.map(params, async (param) => {
+      // if the param already already exist
+      const matchedParam = matchParamInList(param, deviceToReturn.params);
+      if (matchedParam) {
+        const deviceParam = await db.DeviceParam.findOne({
+          where: {
+            id: matchedParam.id,
+          },
+        });
+        await deviceParam.update(param, { transaction });
+        return deviceParam.get({ plain: true });
+      }
+      // if not, we create it.
+      param.device_id = deviceToReturn.id;
+      const paramCreated = await db.DeviceParam.create(param, { transaction });
+      return paramCreated.get({ plain: true });
+    });
+    deviceToReturn.params = newParams;
+
+    return deviceToReturn;
+  });
+
+  // We purge states of all device features that were marked as "keep_history = false"
+  // We do this asynchronously with an event, so it doesn't block the current request
+  // Also, the function called will delete as slowly as possible the event
+  // To make sure that Gladys is not locked during this time
+  deviceFeaturesIdsToPurge.forEach((deviceFeatureIdToPurge) => {
+    this.eventManager.emit(EVENTS.DEVICE.PURGE_STATES_SINGLE_FEATURE, deviceFeatureIdToPurge);
+  });
+
+  // we get the whole device from the DB to avoid
+  // having a partial final object
+  const newDevice = (await getByExternalId(device.external_id)).get({ plain: true });
+
+  // save created device in RAM
+  this.add(newDevice);
+
+  // if the new device should be polled, poll
+  if (newDevice.should_poll) {
+    this.poll(newDevice);
+  }
+  const pollingWasDisabled = newDevice.should_poll === false && oldPollFrequency;
+  const pollingWasUpdated = oldPollFrequency !== newDevice.poll_frequency;
+  if (oldPollFrequency && (pollingWasDisabled || pollingWasUpdated)) {
+    // Remove from poll
+    const { [oldPollFrequency]: devices } = this.devicesByPollFrequency;
+    const deviceIndex = devices.findIndex((d) => d.external_id === device.external_id);
+    if (deviceIndex !== -1) {
+      devices.splice(deviceIndex, 1);
+    }
+  }
+
+  // notify device is succesfully created or updated
+  this.notify(newDevice, actionEvent);
+
+  return newDevice;
+}
+
+module.exports = {
+  create,
+};

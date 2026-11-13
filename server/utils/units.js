@@ -1,0 +1,210 @@
+const { ENERGY_UNIT_FACTORS_IN_WH, UNIT_CONVERSIONS } = require('./unit-conversions');
+
+/**
+ * @description Convert celsius to fahrenheit.
+ * @param {number} celsius - Temperature to convert.
+ * @returns {number} Return the temperature in fahrenheit.
+ * @example
+ * const tempF = celsiusToFahrenheit(12);
+ */
+function celsiusToFahrenheit(celsius) {
+  return (celsius * 9) / 5 + 32;
+}
+
+/**
+ * @description Convert fahrenheit to celsius.
+ * @param {number} fahrenheit - Temperature to convert.
+ * @returns {number} Return the temperature in celsius.
+ * @example
+ * const tempC = fahrenheitToCelsius(100);
+ */
+function fahrenheitToCelsius(fahrenheit) {
+  return ((fahrenheit - 32) * 5) / 9;
+}
+
+const hueToRgb = (p, q, t2) => {
+  let t = t2;
+  if (t < 0) {
+    t += 1;
+  }
+  if (t > 1) {
+    t -= 1;
+  }
+  if (t < 1 / 6) {
+    return p + (q - p) * 6 * t;
+  }
+  if (t < 1 / 2) {
+    return q;
+  }
+  if (t < 2 / 3) {
+    return p + (q - p) * (2 / 3 - t) * 6;
+  }
+  return p;
+};
+
+/**
+ * @description Converts an HSL color value to RGB.
+ * @param {number} h - The hue.
+ * @param {number} s - The saturation.
+ * @param {number} l - The lightness/brightness.
+ * @returns {Array} The RGB representation.
+ * @example
+ * const rgb = hslToRgb(260, 50, 50);
+ */
+function hslToRgb(h, s, l) {
+  // Achromatic (same 0-255 scale as the chromatic path below)
+  if (s === 0) {
+    return [Math.round(l * 255), Math.round(l * 255), Math.round(l * 255)];
+  }
+  const h2 = h / 360;
+
+  const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+  const p = 2 * l - q;
+
+  return [
+    Math.round(hueToRgb(p, q, h2 + 1 / 3) * 255),
+    Math.round(hueToRgb(p, q, h2) * 255),
+    Math.round(hueToRgb(p, q, h2 - 1 / 3) * 255),
+  ];
+}
+
+/**
+ * @description Smart rounding for display:
+ * - 3 significant digits if value < 1 — NOT a fixed number of decimals: a
+ *   fixed cut would collapse a meaningful 0.005 to 0, while full precision
+ *   would keep float noise like 0.10000000149. Significant digits keep the
+ *   magnitude readable whatever it is (0.005 stays 0.005, 0.00123 stays
+ *   0.00123, 0.10000000149 becomes 0.1)
+ * - 2 decimals if value < 10
+ * - 1 decimal if value < 1000
+ * - No decimals (integer) if value >= 1000.
+ * Anything that is not a finite number (null, strings…) is returned untouched.
+ * @param {number} value - Value to round.
+ * @returns {number} Rounded value.
+ * @example
+ * smartRound(0.123); // returns 0.123
+ * smartRound(2.54321); // returns 2.54
+ * smartRound(45.67); // returns 45.7
+ * smartRound(1234.56); // returns 1235
+ */
+function smartRound(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return value;
+  }
+  if (value === 0) {
+    return 0;
+  }
+  if (Math.abs(value) < 1) {
+    return Number(value.toPrecision(3)); // 3 significant digits
+  }
+  if (Math.abs(value) < 10) {
+    return Math.round(value * 100) / 100; // 2 decimals
+  }
+  if (Math.abs(value) < 1000) {
+    return Math.round(value * 10) / 10; // 1 decimal
+  }
+  return Math.round(value); // Integer for large values
+}
+
+/**
+ * @description Number of decimals a number carries, scientific notation included
+ * (`1e-7` has no dot, but seven decimals).
+ * @param {number} number - The number to inspect.
+ * @returns {number} The count of decimals.
+ * @example
+ * decimalsOf(0.0001); // returns 4
+ */
+function decimalsOf(number) {
+  const [mantissa, exponent] = `${number}`.toLowerCase().split('e');
+  const decimals = (mantissa.split('.')[1] || '').length;
+  return exponent ? Math.max(0, decimals - Number(exponent)) : decimals;
+}
+
+/**
+ * @description Display a value at the precision the feature's step declares.
+ * The smartRound display keeps 3 significant digits under 1, which is what a sensor
+ * reading needs but truncates a value the user typed themselves: a 0.1734 EUR/kWh tariff
+ * set on a 0.0001 step would show as 0.173, one digit short of what was sent to the
+ * device. A step finer than 1 therefore decides the number of decimals; anything else
+ * (no step, or a step of 1 and above) keeps the smartRound display of every other feature.
+ * @param {number} value - Value to display.
+ * @param {number} [step] - The step declared on the device feature.
+ * @returns {number|string} The value to display.
+ * @example
+ * formatValueWithStep(0.1734, 0.0001); // returns '0.1734'
+ * formatValueWithStep(0.1734, 1); // returns 0.173
+ */
+function formatValueWithStep(value, step) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    return smartRound(value);
+  }
+  if (!step || !Number.isFinite(step) || step >= 1) {
+    return smartRound(value);
+  }
+  return value.toFixed(decimalsOf(step));
+}
+
+/**
+ * @description Converts a value from one unit to another according to the user's preference.
+ * @param {number} value - Value to convert.
+ * @param {string} fromUnit - Original unit (e.g. 'km', 'mile', 'km/h', 'bar', 'psi', 'kPa', ...).
+ * @param {string} userPreference - User preference ('us' or 'metric').
+ * @returns {{ value: number, unit: string }} Object containing the converted value and the target unit.
+ * @example
+ * const result = convertUnit(10, DEVICE_FEATURE_UNITS.KM, SYSTEM_UNITS.US);
+ * // returns = { value: 6.21, unit: 'mile' }
+ */
+function checkAndConvertUnit(value, fromUnit, userPreference) {
+  const unitsConvertUserPreference = UNIT_CONVERSIONS[userPreference];
+  if (!unitsConvertUserPreference) {
+    // No conversion: keep the original value and unit
+    return { value, unit: fromUnit };
+  }
+  const unitConversionParams = unitsConvertUserPreference[fromUnit];
+  if (!unitConversionParams) {
+    // No conversion: keep the original value and unit
+    return { value, unit: fromUnit };
+  }
+  if (value !== null) {
+    // Convert the value and apply smart rounding
+    const convertedValue = smartRound(unitConversionParams.convert(value));
+    return { value: convertedValue, unit: unitConversionParams.unit };
+  }
+  // When value is null, we still want to get the correct unit format
+  return { value, unit: unitConversionParams.unit };
+}
+
+/**
+ * @description Convert energy units between Wh, kWh, MWh.
+ * @param {number} value - Value to convert.
+ * @param {string} fromUnit - Original unit.
+ * @param {string} toUnit - Target unit.
+ * @returns {number} Converted value.
+ * @example
+ * convertEnergyUnit(1500, DEVICE_FEATURE_UNITS.WATT_HOUR, DEVICE_FEATURE_UNITS.KILOWATT_HOUR); // 1.5
+ */
+function convertEnergyUnit(value, fromUnit, toUnit) {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (!fromUnit || !toUnit || fromUnit === toUnit) {
+    return value;
+  }
+  const fromFactor = ENERGY_UNIT_FACTORS_IN_WH[fromUnit];
+  const toFactor = ENERGY_UNIT_FACTORS_IN_WH[toUnit];
+  if (!fromFactor || !toFactor) {
+    return value;
+  }
+  return (value * fromFactor) / toFactor;
+}
+
+module.exports = {
+  celsiusToFahrenheit,
+  fahrenheitToCelsius,
+  hslToRgb,
+  checkAndConvertUnit,
+  convertEnergyUnit,
+  smartRound,
+  decimalsOf,
+  formatValueWithStep,
+};

@@ -1,0 +1,31 @@
+node_modules
+*.db
+*.duckdb
+*.duckdb.wal
+*.db-shm
+*.db-wal
+*.dbfile-shm
+*.dbfile-wal
+apidoc
+jsdoc
+*.lcov
+.nyc_output
+.env
+build
+static
+gladys-backups
+# test/setup-env.js derives a per-process copy (gladys-backups-<pid>) for
+# every mocha worker: the bare name above does not match those.
+gladys-backups-*
+qemu-*
+coverage
+persist
+stats.json
+size-plugin.json
+# VSCode
+.vscode
+# Webstorm
+.idea
+.tmp
+.DS_Store
+matter-controller-data

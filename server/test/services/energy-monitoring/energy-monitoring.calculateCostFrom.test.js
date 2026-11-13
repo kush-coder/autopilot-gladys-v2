@@ -1,0 +1,1027 @@
+const sinon = require('sinon').createSandbox();
+const { expect } = require('chai');
+const dayjs = require('dayjs');
+const utc = require('dayjs/plugin/utc');
+const timezone = require('dayjs/plugin/timezone');
+const historicalTempoData = require('./data/tempo_mock');
+
+dayjs.extend(utc);
+dayjs.extend(timezone);
+
+const { fake } = sinon;
+const db = require('../../../models');
+const EnergyMonitoring = require('../../../services/energy-monitoring/lib');
+const logger = require('../../../utils/logger');
+const {
+  DEVICE_FEATURE_CATEGORIES,
+  DEVICE_FEATURE_TYPES,
+  DEVICE_FEATURE_UNITS,
+  JOB_TYPES,
+} = require('../../../utils/constants');
+const Job = require('../../../lib/job');
+const {
+  buildManager,
+  addMeterPower,
+  contractPayload,
+  insertConsumption,
+  TEMPO_TARIFF,
+  METER_DEVICE_ID,
+  METER_FEATURE_ID,
+  TEST_SERVICE_ID,
+} = require('../../lib/energy-contract/manager/helpers');
+const {
+  findConsumptionCostPairs,
+  getEffectiveStart,
+} = require('../../../services/energy-monitoring/lib/energy-monitoring.calculateCostFrom');
+
+const POWER_PLUG_ID = 'cf43f956-2f49-4cf9-a7e2-690a014de66e';
+const PLUG_CONSUMPTION_ID = '27488546-e1b8-4cb9-bd75-e20526a94a99';
+const PLUG_COST_ID = '1f4133be-b86c-4a97-9cc8-585fadb74006';
+const TEMPO_CALENDAR = {
+  key: 'tempo',
+  granularity: 'day',
+  timezone: 'Europe/Paris',
+  day_starts_at: '06:00',
+  values: ['blue', 'white', 'red'],
+};
+
+const feature = (overrides) => ({
+  read_only: true,
+  has_feedback: false,
+  min: 0,
+  max: 1000,
+  category: DEVICE_FEATURE_CATEGORIES.ENERGY_SENSOR,
+  ...overrides,
+});
+
+describe('EnergyMonitoring.calculateCostFrom', () => {
+  let gladys;
+  let energyContract;
+  let device;
+  let meter;
+  let energyMonitoring;
+  const costStates = (selector = 'power-plug-consumption-cost') =>
+    device.getDeviceFeatureStates(selector, new Date('2020-01-01T00:00:00.000Z'), new Date('2030-01-01T00:00:00.000Z'));
+
+  beforeEach(async () => {
+    ({ energyContract, device, meter } = await buildManager());
+    gladys = {
+      device,
+      energyContract,
+      event: { on: fake.returns(null) },
+      job: { updateProgress: fake.returns(null), wrapper: (name, func) => func },
+    };
+    // a power plug whose consumption is a child of the meter
+    await device.create({
+      id: POWER_PLUG_ID,
+      service_id: TEST_SERVICE_ID,
+      name: 'Power plug',
+      external_id: 'power-plug',
+      features: [
+        feature({
+          id: PLUG_CONSUMPTION_ID,
+          selector: 'power-plug-consumption',
+          external_id: 'power-plug-consumption',
+          name: 'Power plug Consumption',
+          type: DEVICE_FEATURE_TYPES.ENERGY_SENSOR.THIRTY_MINUTES_CONSUMPTION,
+          energy_parent_id: METER_FEATURE_ID,
+        }),
+        feature({
+          id: PLUG_COST_ID,
+          selector: 'power-plug-consumption-cost',
+          external_id: 'power-plug-consumption-cost',
+          name: 'Power plug Consumption Cost',
+          type: DEVICE_FEATURE_TYPES.ENERGY_SENSOR.THIRTY_MINUTES_CONSUMPTION_COST,
+          energy_parent_id: PLUG_CONSUMPTION_ID,
+        }),
+      ],
+    });
+    energyMonitoring = new EnergyMonitoring(gladys, '43732e67-6669-4a95-83d6-38c50b835387');
+  });
+  afterEach(() => sinon.restore());
+
+  it('should price the consumption of the meter and its children with the active contract', async () => {
+    await energyContract.create(contractPayload({ valid_from: '2025-01-01' }));
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 10, created_at: new Date('2025-08-28T15:00:00.000Z') },
+      { value: 20, created_at: new Date('2025-08-28T15:30:00.000Z') },
+    ]);
+    await insertConsumption([{ value: 1, created_at: new Date('2025-08-28T15:00:00.000Z') }]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T00:00:00.000Z'));
+    const states = await costStates();
+    expect(states).to.have.lengthOf(2);
+    // 0.2 per kWh, the subscription of 12/month is never stored (added at display time)
+    expect(states[0].value).to.equal(10 * 0.2);
+    expect(states[1].value).to.equal(20 * 0.2);
+    const meterStates = await costStates('electrical-meter-cost');
+    expect(meterStates).to.have.lengthOf(1);
+    expect(meterStates[0].value).to.equal(1 * 0.2);
+    expect(gladys.job.updateProgress.called).to.equal(false);
+    // a run with a job id reports its progress
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T00:00:00.000Z'), 'job-id');
+    expect(gladys.job.updateProgress.callCount).to.equal(2);
+  });
+
+  it('should compute nothing for a meter without contract', async () => {
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 10, created_at: new Date('2025-08-28T15:00:00.000Z') },
+    ]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T00:00:00.000Z'));
+    expect(await costStates()).to.have.lengthOf(0);
+  });
+
+  it('should only recalculate the devices in options.deviceIds or the meters in electricMeterDeviceIds', async () => {
+    await energyContract.create(contractPayload());
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 10, created_at: new Date('2025-08-28T15:00:00.000Z') },
+    ]);
+    const date = new Date('2025-08-28T00:00:00.000Z');
+    await energyMonitoring.calculateCostFrom(date, null, { deviceIds: [METER_DEVICE_ID] });
+    expect(await costStates()).to.have.lengthOf(0);
+    await energyMonitoring.calculateCostFrom(date, null, { electricMeterDeviceIds: ['other-meter'] });
+    expect(await costStates()).to.have.lengthOf(0);
+    await energyMonitoring.calculateCostFrom(date, null, { electricMeterDeviceIds: [METER_DEVICE_ID] });
+    expect(await costStates()).to.have.lengthOf(1);
+  });
+
+  it('should not price an interval outside every contract and pick the contract by date', async () => {
+    await energyContract.create(contractPayload({ valid_from: '2020-01-01', valid_to: '2020-12-31' }));
+    await energyContract.create(
+      contractPayload({
+        name: 'New',
+        valid_from: '2025-09-01',
+        tariff: {
+          tariff_version: 1,
+          components: [{ key: 'e', kind: 'consumption', rules: [], fallback: { price: 0.5 } }],
+        },
+      }),
+    );
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 10, created_at: new Date('2025-08-28T15:00:00.000Z') },
+      // 2025-09-01 00:00 Paris is 2025-08-31 22:00 UTC: this interval starts at 22:30 Paris on the 31st
+      { value: 10, created_at: new Date('2025-08-31T21:00:00.000Z') },
+      { value: 10, created_at: new Date('2025-08-31T22:30:00.000Z') },
+    ]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-01T00:00:00.000Z'));
+    const states = await costStates();
+    expect(states).to.have.lengthOf(1);
+    expect(states[0].value).to.equal(5);
+    expect(new Date(states[0].created_at).toISOString()).to.equal('2025-08-31T22:30:00.000Z');
+  });
+
+  it('should convert Watt-hour states and daily consumption features', async () => {
+    await energyContract.create(
+      contractPayload({
+        tariff: {
+          tariff_version: 1,
+          components: [{ key: 'e', kind: 'consumption', rules: [], fallback: { price: 0.18 } }],
+        },
+      }),
+    );
+    await device.create({
+      id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      service_id: TEST_SERVICE_ID,
+      name: 'Daily meter',
+      external_id: 'daily-meter',
+      features: [
+        feature({
+          id: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
+          selector: 'daily-consumption',
+          external_id: 'daily-consumption',
+          name: 'Daily consumption (Wh)',
+          type: DEVICE_FEATURE_TYPES.ENERGY_SENSOR.DAILY_CONSUMPTION,
+          unit: DEVICE_FEATURE_UNITS.WATT_HOUR,
+          energy_parent_id: METER_FEATURE_ID,
+        }),
+        feature({
+          id: 'c3d4e5f6-a789-0123-cdef-234567890abc',
+          selector: 'daily-consumption-cost',
+          external_id: 'daily-consumption-cost',
+          name: 'Daily consumption cost',
+          type: DEVICE_FEATURE_TYPES.ENERGY_SENSOR.DAILY_CONSUMPTION_COST,
+          energy_parent_id: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
+        }),
+      ],
+    });
+    await db.duckDbBatchInsertState('b2c3d4e5-f6a7-8901-bcde-f12345678901', [
+      { value: 5000, created_at: new Date('2025-08-28T15:00:00.000Z') },
+    ]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T00:00:00.000Z'));
+    const states = await costStates('daily-consumption-cost');
+    expect(states).to.have.lengthOf(1);
+    expect(states[0].value).to.equal(0.9);
+  });
+
+  it('should price a Tempo contract with the calendar published by the internal provider', async () => {
+    await energyContract.declareCalendar(TEMPO_CALENDAR, TEST_SERVICE_ID);
+    await energyContract.publishCalendarEntries(
+      'tempo',
+      historicalTempoData
+        .filter((d) => d.created_at >= '2025-01-01')
+        .map((d) => ({ date: d.created_at, value: d.day_type })),
+      { provider_service_id: TEST_SERVICE_ID, skip_recalculation: true },
+    );
+    await energyContract.create(contractPayload({ name: 'Tempo', tariff: TEMPO_TARIFF, valid_from: '2025-01-01' }));
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      // RED day (2025-01-03), off peak then peak
+      { value: 10, created_at: dayjs.tz('2025-01-03T05:30:00.000Z', 'Europe/Paris').toDate() },
+      { value: 10, created_at: dayjs.tz('2025-01-03T10:30:00.000Z', 'Europe/Paris').toDate() },
+      // BLUE day (2025-01-05), peak then off peak
+      { value: 10, created_at: dayjs.tz('2025-01-05T15:30:00.000Z', 'Europe/Paris').toDate() },
+      { value: 10, created_at: dayjs.tz('2025-01-05T22:30:00.000Z', 'Europe/Paris').toDate() },
+    ]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-01-01T00:00:00.000Z'));
+    const states = await costStates();
+    expect(states.map((s) => s.value)).to.deep.equal([1.568, 7.562, 1.609, 1.296]);
+  });
+
+  it('should recompute a tiered contract from the start of its accumulation period', async () => {
+    const contract = await energyContract.create(
+      contractPayload({
+        name: 'Tiered',
+        timezone: 'UTC',
+        tariff: {
+          tariff_version: 1,
+          components: [
+            {
+              key: 'e',
+              kind: 'consumption',
+              rules: [{ when: { tier: { cumulative: 'day', from_kwh: 0, to_kwh: 10 } }, price: 0.1 }],
+              fallback: { price: 1 },
+            },
+          ],
+        },
+      }),
+    );
+    const compiled = energyContract.getCompiledTariff(contract);
+    const now = Date.now();
+    expect(getEffectiveStart(contract, compiled, new Date('2025-08-28T15:00:00.000Z'), now).toISOString()).to.equal(
+      '2025-08-28T00:00:00.000Z',
+    );
+    // a 30-minute feature carries its accumulation into the window instead
+    expect(
+      getEffectiveStart(contract, compiled, new Date('2025-08-28T15:00:00.000Z'), now, {
+        widenTiers: false,
+      }).toISOString(),
+    ).to.equal('2025-08-28T15:00:00.000Z');
+    expect(
+      getEffectiveStart(contract, { hasTier: false }, new Date('2025-08-28T15:00:00.000Z'), now).toISOString(),
+    ).to.equal('2025-08-28T15:00:00.000Z');
+    const monthly = { ...contract, billing_period_start_day: 5 };
+    expect(
+      getEffectiveStart(
+        monthly,
+        { hasTier: true, tierScopes: ['month', 'billing_period'] },
+        new Date('2025-08-28T15:00:00.000Z'),
+        now,
+      ).toISOString(),
+    ).to.equal('2025-08-01T00:00:00.000Z');
+    // never before the contract's local valid_from midnight: a contract starting inside the window
+    // does not widen it, one starting mid-period widens to its own start only
+    expect(
+      getEffectiveStart(
+        { ...contract, valid_from: '2025-08-28' },
+        compiled,
+        new Date('2025-08-27T23:30:00.000Z'),
+        now,
+      ).toISOString(),
+    ).to.equal('2025-08-27T23:30:00.000Z');
+    expect(
+      getEffectiveStart(
+        { ...contract, valid_from: '2025-08-10' },
+        { hasTier: true, tierScopes: ['month'] },
+        new Date('2025-08-28T15:00:00.000Z'),
+        now,
+      ).toISOString(),
+    ).to.equal('2025-08-10T00:00:00.000Z');
+    // demand charges: an elapsed billing period is repriced whole, the current one is left as it is
+    expect(
+      getEffectiveStart(
+        { timezone: 'UTC' },
+        { hasDemand: true },
+        new Date('2025-08-28T15:00:00.000Z'),
+        now,
+      ).toISOString(),
+    ).to.equal('2025-08-01T00:00:00.000Z');
+    expect(
+      getEffectiveStart(monthly, { hasDemand: true }, new Date('2025-08-28T15:00:00.000Z'), now).toISOString(),
+    ).to.equal('2025-08-05T00:00:00.000Z');
+    expect(
+      getEffectiveStart(
+        monthly,
+        { hasDemand: true },
+        new Date('2025-08-28T15:00:00.000Z'),
+        Date.parse('2025-08-30T00:00:00.000Z'),
+      ).toISOString(),
+    ).to.equal('2025-08-28T15:00:00.000Z');
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 8, created_at: new Date('2025-08-28T10:00:00.000Z') },
+      { value: 4, created_at: new Date('2025-08-28T15:00:00.000Z') },
+    ]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T00:00:00.000Z'));
+    expect((await costStates()).map((s) => s.value)).to.deep.equal([0.8, 0.2 + 2]);
+    // asked from 14:00: the 8 kWh of the morning are carried into the window, so the second
+    // interval stays in tier 2, and the morning is neither repriced nor rewritten
+    const replace = sinon.spy(device, 'replaceHistoricalStatesFrom');
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T14:00:00.000Z'));
+    const plugReplace = replace.getCalls().find((call) => call.args[0] === PLUG_COST_ID);
+    expect(plugReplace.args[1].toISOString()).to.equal('2025-08-28T14:00:00.000Z');
+    expect(plugReplace.args[2].map((state) => state.value)).to.deep.equal([0.2 + 2]);
+    const states = await costStates();
+    expect(states.map((s) => s.value)).to.deep.equal([0.8, 0.2 + 2]);
+  });
+
+  it('should give a run starting mid-period the costs of a full recalculation (filtered counters)', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Allowance',
+        timezone: 'Europe/Paris',
+        valid_from: '2020-01-01',
+        billing_period_start_day: 3,
+        tariff: {
+          tariff_version: 1,
+          components: [
+            {
+              key: 'e',
+              kind: 'consumption',
+              rules: [
+                // the off-peak allowance only counts the off-peak energy
+                {
+                  label: 'off-peak allowance',
+                  when: {
+                    time: [['22:00', '06:00']],
+                    tier: {
+                      cumulative: 'billing_period',
+                      from_kwh_per_day: 0,
+                      to_kwh_per_day: 0.1,
+                      counts_when: { time: [['22:00', '06:00']] },
+                    },
+                  },
+                  price: 0.05,
+                },
+                { label: 'month', when: { tier: { cumulative: 'month', from_kwh: 0, to_kwh: 30 } }, price: 0.1 },
+              ],
+              fallback: { price: 0.3 },
+            },
+          ],
+        },
+      }),
+    );
+    const states = [];
+    // 1 to 4 September 2025, a billing period starting on the 3rd
+    for (let ms = Date.parse('2025-08-31T22:30:00.000Z'); ms <= Date.parse('2025-09-04T22:00:00.000Z'); ms += 1800000) {
+      states.push({ value: 0.2 + ((ms / 1800000) % 5) / 10, created_at: new Date(ms) });
+    }
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, states);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-31T22:30:00.000Z'));
+    const full = (await costStates()).map((s) => s.value);
+    expect(full).to.have.lengthOf(states.length);
+    // runs starting in the middle of a day, of the billing period and of the month
+    await energyMonitoring.calculateCostFrom(new Date('2025-09-03T13:00:00.000Z'));
+    expect((await costStates()).map((s) => s.value)).to.deep.equal(full);
+    await energyMonitoring.calculateCostFrom(new Date('2025-09-04T03:30:00.000Z'));
+    expect((await costStates()).map((s) => s.value)).to.deep.equal(full);
+    await energyMonitoring.calculateCostFrom(new Date('2025-09-02T08:00:00.000Z'));
+    expect((await costStates()).map((s) => s.value)).to.deep.equal(full);
+  });
+
+  it('should never reprice the last interval of the previous day with an empty day accumulation', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Daily allowance',
+        timezone: 'UTC',
+        valid_from: '2020-01-01',
+        tariff: {
+          tariff_version: 1,
+          components: [
+            {
+              key: 'e',
+              kind: 'consumption',
+              rules: [{ when: { tier: { cumulative: 'day', from_kwh: 0, to_kwh: 10 } }, price: 0.1 }],
+              fallback: { price: 1 },
+            },
+          ],
+        },
+      }),
+    );
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 8, created_at: new Date('2025-08-27T23:30:00.000Z') },
+      // the 23:30 - 00:00 interval of the 27th: its state is created at midnight
+      { value: 4, created_at: new Date('2025-08-28T00:00:00.000Z') },
+      { value: 1, created_at: new Date('2025-08-28T15:00:00.000Z') },
+    ]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-27T00:00:00.000Z'));
+    expect((await costStates()).map((s) => s.value)).to.deep.equal([0.8, 0.2 + 2, 0.1]);
+    // a run widened to the start of the 28th (a 30-minute job, a calendar recalculation) leaves
+    // the last interval of the 27th as it was priced with the 27th's accumulation
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T14:00:00.000Z'));
+    expect((await costStates()).map((s) => s.value)).to.deep.equal([0.8, 0.2 + 2, 0.1]);
+  });
+
+  it('should never widen a contract starting today to the costs of yesterday', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Starts today',
+        timezone: 'UTC',
+        valid_from: '2025-08-28',
+        tariff: {
+          tariff_version: 1,
+          components: [
+            {
+              key: 'e',
+              kind: 'consumption',
+              rules: [{ when: { tier: { cumulative: 'day', from_kwh: 0, to_kwh: 10 } }, price: 0.1 }],
+              fallback: { price: 1 },
+            },
+          ],
+        },
+      }),
+    );
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 1, created_at: new Date('2025-08-27T10:00:00.000Z') },
+      { value: 2, created_at: new Date('2025-08-28T00:30:00.000Z') },
+    ]);
+    // costs stored before this contract, by another one since deleted: none is this contract's
+    await db.duckDbBatchInsertState(PLUG_COST_ID, [
+      { value: 99, created_at: new Date('2025-08-27T10:00:00.000Z') },
+      { value: 98, created_at: new Date('2025-08-27T23:30:00.000Z') },
+    ]);
+    // the 00:30 job of the contract's first day: its window starts at 23:30 the day before
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T00:00:00.000Z'));
+    expect((await costStates()).map((s) => s.value)).to.deep.equal([99, 98, 0.2]);
+  });
+
+  it('should price the daily state stamped at the start of its day after a per-day tier widening', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Daily allowance',
+        timezone: 'UTC',
+        tariff: {
+          tariff_version: 1,
+          components: [
+            {
+              key: 'e',
+              kind: 'consumption',
+              rules: [{ when: { tier: { cumulative: 'day', from_kwh_per_day: 0, to_kwh_per_day: 40 } }, price: 0.1 }],
+              fallback: { price: 1 },
+            },
+          ],
+        },
+      }),
+    );
+    await device.create({
+      id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      service_id: TEST_SERVICE_ID,
+      name: 'Daily meter',
+      external_id: 'daily-meter',
+      features: [
+        feature({
+          id: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
+          selector: 'daily-consumption',
+          external_id: 'daily-consumption',
+          name: 'Daily consumption',
+          type: DEVICE_FEATURE_TYPES.ENERGY_SENSOR.DAILY_CONSUMPTION,
+          unit: DEVICE_FEATURE_UNITS.KILOWATT_HOUR,
+          energy_parent_id: METER_FEATURE_ID,
+        }),
+        feature({
+          id: 'c3d4e5f6-a789-0123-cdef-234567890abc',
+          selector: 'daily-consumption-cost',
+          external_id: 'daily-consumption-cost',
+          name: 'Daily consumption cost',
+          type: DEVICE_FEATURE_TYPES.ENERGY_SENSOR.DAILY_CONSUMPTION_COST,
+          energy_parent_id: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
+        }),
+      ],
+    });
+    // one state per day, stamped at the start of its day
+    await db.duckDbBatchInsertState('b2c3d4e5-f6a7-8901-bcde-f12345678901', [
+      { value: 5, created_at: new Date('2025-08-28T00:00:00.000Z') },
+    ]);
+    // a run during the day widens to its midnight: the day's state is in the window
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T12:00:00.000Z'));
+    expect((await costStates('daily-consumption-cost')).map((s) => s.value)).to.deep.equal([0.5]);
+  });
+
+  it('should price a daily state on its own local date', async () => {
+    // contract A until Monday 12 January, contract B from Tuesday 13 January (Paris)
+    await energyContract.create(
+      contractPayload({
+        name: 'Before',
+        timezone: 'Europe/Paris',
+        valid_from: '2026-01-01',
+        valid_to: '2026-01-12',
+        tariff: {
+          tariff_version: 1,
+          components: [{ key: 'e', kind: 'consumption', rules: [], fallback: { price: 1 } }],
+        },
+      }),
+    );
+    await energyContract.create(
+      contractPayload({
+        name: 'After',
+        timezone: 'Europe/Paris',
+        valid_from: '2026-01-13',
+        tariff: {
+          tariff_version: 1,
+          components: [
+            {
+              key: 'e',
+              kind: 'consumption',
+              rules: [{ when: { weekdays: ['tue'] }, price: 0.3 }],
+              fallback: { price: 0.2 },
+            },
+          ],
+        },
+      }),
+    );
+    await device.create({
+      id: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+      service_id: TEST_SERVICE_ID,
+      name: 'Daily meter',
+      external_id: 'daily-meter',
+      features: [
+        feature({
+          id: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
+          selector: 'daily-consumption',
+          external_id: 'daily-consumption',
+          name: 'Daily consumption',
+          type: DEVICE_FEATURE_TYPES.ENERGY_SENSOR.DAILY_CONSUMPTION,
+          unit: DEVICE_FEATURE_UNITS.KILOWATT_HOUR,
+          energy_parent_id: METER_FEATURE_ID,
+        }),
+        feature({
+          id: 'c3d4e5f6-a789-0123-cdef-234567890abc',
+          selector: 'daily-consumption-cost',
+          external_id: 'daily-consumption-cost',
+          name: 'Daily consumption cost',
+          type: DEVICE_FEATURE_TYPES.ENERGY_SENSOR.DAILY_CONSUMPTION_COST,
+          energy_parent_id: 'b2c3d4e5-f6a7-8901-bcde-f12345678901',
+        }),
+      ],
+    });
+    // stamped at local midnight: Monday 12, Tuesday 13 and Wednesday 14 January in Paris
+    await db.duckDbBatchInsertState('b2c3d4e5-f6a7-8901-bcde-f12345678901', [
+      { value: 10, created_at: new Date('2026-01-11T23:00:00.000Z') },
+      { value: 10, created_at: new Date('2026-01-12T23:00:00.000Z') },
+      { value: 10, created_at: new Date('2026-01-13T23:00:00.000Z') },
+    ]);
+    await energyMonitoring.calculateCostFrom(new Date('2026-01-11T23:00:00.000Z'));
+    // shifted by 30 minutes, Tuesday would be priced as Monday by contract A (10) and
+    // Wednesday as Tuesday (3)
+    expect((await costStates('daily-consumption-cost')).map((s) => s.value)).to.deep.equal([10, 3, 2]);
+  });
+
+  it('should reprice a whole elapsed billing period when a run starts at its end', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Demand',
+        timezone: 'UTC',
+        valid_from: '2020-01-01',
+        tariff: {
+          tariff_version: 1,
+          components: [
+            { key: 'e', kind: 'consumption', rules: [], fallback: { price: 0 } },
+            { key: 'demand', kind: 'demand', price: 10, per: 'billing_period', aggregation: 'max' },
+          ],
+        },
+      }),
+    );
+    await insertConsumption([
+      // 4 kW over 14:30 - 15:00, 1 kW over the last half-hour of August
+      { value: 2, created_at: new Date('2025-08-28T15:00:00.000Z') },
+      { value: 0.5, created_at: new Date('2025-09-01T00:00:00.000Z') },
+      { value: 0.5, created_at: new Date('2025-09-01T00:30:00.000Z') },
+    ]);
+    // the first run of September, at 00:00: August is repriced whole, its peak is 4 kW (charged
+    // on the last half-hour of August alone, it would have been 1 kW); September 2025 has ended
+    // too, on its own 1 kW peak
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-31T23:30:00.000Z'));
+    const states = await costStates('electrical-meter-cost');
+    expect(states.map((s) => s.value)).to.deep.equal([20, 20, 10]);
+  });
+
+  it('should apply the demand charges of an elapsed billing period only', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Demand',
+        timezone: 'UTC',
+        valid_from: '2020-01-01',
+        tariff: {
+          tariff_version: 1,
+          components: [
+            { key: 'e', kind: 'consumption', rules: [], fallback: { price: 0 } },
+            { key: 'demand', kind: 'demand', price: 10, per: 'billing_period', aggregation: 'max' },
+          ],
+        },
+      }),
+    );
+    const now = Date.now();
+    await insertConsumption([
+      { value: 1, created_at: new Date('2025-08-28T15:00:00.000Z') },
+      { value: 2, created_at: new Date('2025-08-28T15:30:00.000Z') },
+      { value: 1, created_at: new Date(now - 30 * 60 * 1000) },
+    ]);
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 1, created_at: new Date('2025-08-28T15:00:00.000Z') },
+      { value: 2, created_at: new Date('2025-08-28T15:30:00.000Z') },
+      { value: 1, created_at: new Date(now - 30 * 60 * 1000) },
+    ]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-01T00:00:00.000Z'));
+    const states = await costStates('electrical-meter-cost');
+    expect(states).to.have.lengthOf(3);
+    // August is closed: 4 kW peak * 10 spread pro rata over the two intervals
+    expect(states[0].value + states[1].value).to.equal(40);
+    // the current period is not charged
+    expect(states[2].value).to.equal(0);
+    // the demand charge is the meter's: a child device never carries it
+    expect((await costStates()).map((s) => s.value)).to.deep.equal([0, 0, 0]);
+  });
+
+  it('should read the peaks of the demand charges on the historized power feature of the meter', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Demand',
+        timezone: 'UTC',
+        valid_from: '2020-01-01',
+        tariff: {
+          tariff_version: 1,
+          components: [
+            { key: 'e', kind: 'consumption', rules: [], fallback: { price: 0 } },
+            { key: 'demand', kind: 'demand', price: 10, per: 'billing_period', aggregation: 'max' },
+          ],
+        },
+      }),
+    );
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 1, created_at: new Date('2025-08-28T15:00:00.000Z') },
+      { value: 2, created_at: new Date('2025-08-28T15:30:00.000Z') },
+      { value: 1, created_at: new Date(Date.now() - 30 * 60 * 1000) },
+    ]);
+    // a 6 kW peak in the first interval (14:30 to 15:00), the second one keeps its 4 kW average
+    await addMeterPower(device, meter, [
+      { value: 6000, created_at: new Date('2025-08-28T14:40:00.000Z') },
+      { value: 1000, created_at: new Date('2025-08-28T14:50:00.000Z') },
+    ]);
+    // a second device on the same meter: the peaks are loaded once per run
+    await device.create({
+      id: 'df43f956-2f49-4cf9-a7e2-690a014de66e',
+      service_id: TEST_SERVICE_ID,
+      name: 'Second plug',
+      external_id: 'second-plug',
+      features: [
+        feature({
+          id: '37488546-e1b8-4cb9-bd75-e20526a94a99',
+          selector: 'second-plug-consumption',
+          external_id: 'second-plug-consumption',
+          name: 'Second plug Consumption',
+          type: DEVICE_FEATURE_TYPES.ENERGY_SENSOR.THIRTY_MINUTES_CONSUMPTION,
+          energy_parent_id: METER_FEATURE_ID,
+        }),
+        feature({
+          id: '2f4133be-b86c-4a97-9cc8-585fadb74006',
+          selector: 'second-plug-consumption-cost',
+          external_id: 'second-plug-consumption-cost',
+          name: 'Second plug Consumption Cost',
+          type: DEVICE_FEATURE_TYPES.ENERGY_SENSOR.THIRTY_MINUTES_CONSUMPTION_COST,
+          energy_parent_id: '37488546-e1b8-4cb9-bd75-e20526a94a99',
+        }),
+      ],
+    });
+    await insertConsumption([
+      { value: 1, created_at: new Date('2025-08-28T15:00:00.000Z') },
+      { value: 2, created_at: new Date('2025-08-28T15:30:00.000Z') },
+      { value: 1, created_at: new Date(Date.now() - 30 * 60 * 1000) },
+    ]);
+    const getMeterPowerPeaks = sinon.spy(energyContract, 'getMeterPowerPeaks');
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-01T00:00:00.000Z'));
+    const states = await costStates('electrical-meter-cost');
+    expect(states).to.have.lengthOf(3);
+    expect(states[0].value + states[1].value).to.equal(60);
+    expect(getMeterPowerPeaks.callCount).to.equal(1);
+  });
+
+  it('should keep the previous costs when the pricing fails', async () => {
+    await energyContract.create(contractPayload({ name: 'Flat', timezone: 'UTC', valid_from: '2020-01-01' }));
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 1, created_at: new Date('2025-08-28T15:00:00.000Z') },
+    ]);
+    await db.duckDbBatchInsertState(PLUG_COST_ID, [{ value: 99, created_at: new Date('2025-08-28T15:00:00.000Z') }]);
+    sinon.stub(energyContract, 'priceContractIntervals').rejects(new Error('integration down'));
+    const error = sinon.stub(logger, 'error');
+    const result = await energyMonitoring.calculateCostFrom(new Date('2025-08-01T00:00:00.000Z'));
+    expect(error.callCount).to.equal(1);
+    // reported to the callers that must retry (the pending recalculation of the migration)
+    expect(result.failures).to.equal(1);
+    const states = await costStates();
+    expect(states.map((s) => s.value)).to.deep.equal([99]);
+    // a failed replacement is counted too (the replacement itself is atomic, models tests)
+    energyContract.priceContractIntervals.restore();
+    sinon.stub(device, 'replaceHistoricalStatesFrom').rejects(new Error('duckdb down'));
+    // the replacement runs for every pair, the meter's own cost feature included
+    const second = await energyMonitoring.calculateCostFrom(new Date('2025-08-01T00:00:00.000Z'));
+    expect(second.failures).to.equal(2);
+    expect((await costStates()).map((s) => s.value)).to.deep.equal([99]);
+  });
+
+  it('should not widen the run window for a tiered contract that is expired', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Old tiered',
+        timezone: 'UTC',
+        valid_from: '2020-01-01',
+        valid_to: '2024-12-31',
+        tariff: {
+          tariff_version: 1,
+          components: [
+            {
+              key: 'e',
+              kind: 'consumption',
+              rules: [{ when: { tier: { cumulative: 'month', from_kwh: 0, to_kwh: 10 } }, price: 0.1 }],
+              fallback: { price: 1 },
+            },
+          ],
+        },
+      }),
+    );
+    await energyContract.create(
+      contractPayload({
+        name: 'Flat',
+        timezone: 'UTC',
+        valid_from: '2025-01-01',
+        tariff: {
+          tariff_version: 1,
+          components: [{ key: 'e', kind: 'consumption', rules: [], fallback: { price: 0.2 } }],
+        },
+      }),
+    );
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 8, created_at: new Date('2025-08-28T10:00:00.000Z') },
+      { value: 4, created_at: new Date('2025-08-28T15:00:00.000Z') },
+    ]);
+    // a cost already stored before the run window: an expired tier must not recompute it
+    await db.duckDbBatchInsertState(PLUG_COST_ID, [{ value: 99, created_at: new Date('2025-08-28T10:00:00.000Z') }]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T14:00:00.000Z'));
+    const states = await costStates();
+    expect(states.map((s) => s.value)).to.deep.equal([99, 0.8]);
+  });
+
+  it('should carry the month accumulation over a billing period starting mid-month', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Month tier',
+        timezone: 'UTC',
+        valid_from: '2020-01-01',
+        billing_period_start_day: 15,
+        tariff: {
+          tariff_version: 1,
+          components: [
+            {
+              key: 'e',
+              kind: 'consumption',
+              rules: [{ when: { tier: { cumulative: 'month', from_kwh: 0, to_kwh: 10 } }, price: 0.1 }],
+              fallback: { price: 1 },
+            },
+          ],
+        },
+      }),
+    );
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 8, created_at: new Date('2025-08-14T10:00:00.000Z') },
+      { value: 4, created_at: new Date('2025-08-16T10:00:00.000Z') },
+      { value: 4, created_at: new Date('2025-09-16T10:00:00.000Z') },
+    ]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-01T00:00:00.000Z'));
+    const states = await costStates();
+    // 8 kWh in tier 1, then 2 in tier 1 and 2 above: the billing period of the 15th does not
+    // restart the month; the September interval starts a new month
+    expect(states.map((s) => Math.round(s.value * 100) / 100)).to.deep.equal([0.8, 2.2, 0.4]);
+  });
+
+  it('should carry the counted accumulation of a counts_when tier over a billing period', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Counted month tier',
+        timezone: 'UTC',
+        valid_from: '2020-01-01',
+        billing_period_start_day: 15,
+        tariff: {
+          tariff_version: 1,
+          components: [
+            {
+              key: 'e',
+              kind: 'consumption',
+              rules: [
+                { when: { time: [['22:00', '06:00']] }, price: 0.5 },
+                {
+                  when: {
+                    tier: { cumulative: 'month', from_kwh: 0, to_kwh: 10, counts_when: { time: [['06:00', '22:00']] } },
+                  },
+                  price: 0.1,
+                },
+              ],
+              fallback: { price: 1 },
+            },
+          ],
+        },
+      }),
+    );
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 8, created_at: new Date('2025-08-14T10:00:00.000Z') },
+      // night: priced by the night rule, not counted in the allowance
+      { value: 5, created_at: new Date('2025-08-14T23:30:00.000Z') },
+      { value: 4, created_at: new Date('2025-08-16T10:00:00.000Z') },
+      { value: 4, created_at: new Date('2025-09-16T10:00:00.000Z') },
+    ]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-01T00:00:00.000Z'));
+    const states = await costStates();
+    // 8 kWh counted in tier 1, the night kWh at the night price, then in the next billing
+    // period of the same month 2 kWh left in tier 1 and 2 above; September restarts
+    expect(states.map((s) => Math.round(s.value * 100) / 100)).to.deep.equal([0.8, 2.5, 2.2, 0.4]);
+  });
+
+  it('should not carry the month accumulation over a skipped billing period', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Month tier',
+        timezone: 'UTC',
+        valid_from: '2020-01-01',
+        billing_period_start_day: 15,
+        tariff: {
+          tariff_version: 1,
+          components: [
+            {
+              key: 'e',
+              kind: 'consumption',
+              rules: [{ when: { tier: { cumulative: 'month', from_kwh: 0, to_kwh: 10 } }, price: 0.1 }],
+              fallback: { price: 1 },
+            },
+          ],
+        },
+      }),
+    );
+    // the Jul 15 - Aug 14 period, nothing in Aug 15 - Sep 14, then the Sep 15 - Oct 14 one
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 8, created_at: new Date('2025-08-14T10:00:00.000Z') },
+      { value: 4, created_at: new Date('2025-10-10T10:00:00.000Z') },
+    ]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-01T00:00:00.000Z'));
+    const states = await costStates();
+    expect(states.map((s) => Math.round(s.value * 100) / 100)).to.deep.equal([0.8, 0.4]);
+  });
+
+  it('should keep the previous costs of the intervals an unavailable delegated integration cannot price', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Agile',
+        pricing_mode: 'delegated',
+        provider_service_id: TEST_SERVICE_ID,
+        tariff: { tariff_version: 1, components: [{ key: 's', kind: 'fixed', amount: 1, per: 'day' }] },
+      }),
+    );
+    energyContract.externalIntegration = {
+      priceEnergyContract: fake.rejects(new Error('EXTERNAL_INTEGRATION_NOT_CONNECTED')),
+    };
+    const warn = sinon.stub(logger, 'warn');
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 1, created_at: new Date('2025-08-28T15:00:00.000Z') },
+      { value: 1, created_at: new Date('2025-08-28T15:30:00.000Z') },
+    ]);
+    // the first interval was priced by a previous run, the second never was
+    await db.duckDbBatchInsertState(PLUG_COST_ID, [{ value: 0.42, created_at: new Date('2025-08-28T15:00:00.000Z') }]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T00:00:00.000Z'));
+    const states = await costStates();
+    expect(states.map((s) => [new Date(s.created_at).toISOString(), s.value])).to.deep.equal([
+      ['2025-08-28T15:00:00.000Z', 0.42],
+    ]);
+    expect(warn.args.some(([message]) => /left without a new cost/.test(message))).to.equal(true);
+    // a failed request is not a fallback pricing
+    expect(warn.args.some(([message]) => /priced by a fallback/.test(message))).to.equal(false);
+  });
+
+  it('should keep the costs of an orphaned delegated contract untouched and never price it', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Orphan',
+        pricing_mode: 'delegated',
+        tariff: { tariff_version: 1, components: [{ key: 's', kind: 'fixed', amount: 1, per: 'day' }] },
+      }),
+    );
+    const priceEnergyContract = fake.resolves(new Map());
+    energyContract.externalIntegration = { priceEnergyContract };
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 1, created_at: new Date('2025-08-28T15:00:00.000Z') },
+      { value: 1, created_at: new Date('2025-08-28T15:30:00.000Z') },
+    ]);
+    await db.duckDbBatchInsertState(PLUG_COST_ID, [{ value: 0.42, created_at: new Date('2025-08-28T15:00:00.000Z') }]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-01T00:00:00.000Z'));
+    expect(priceEnergyContract.callCount).to.equal(0);
+    expect((await costStates()).map((s) => s.value)).to.deep.equal([0.42]);
+  });
+
+  it('should hand a delegated integration the real accumulation of a window starting mid-period', async () => {
+    await energyContract.create(
+      contractPayload({
+        name: 'Agile',
+        pricing_mode: 'delegated',
+        provider_service_id: TEST_SERVICE_ID,
+        timezone: 'UTC',
+        valid_from: '2020-01-01',
+        tariff: { tariff_version: 1, components: [{ key: 's', kind: 'fixed', amount: 1, per: 'day' }] },
+      }),
+    );
+    const priceEnergyContract = fake(async (c, payload) => {
+      const answers = new Map();
+      payload.intervals.forEach((i) => answers.set(i.starts_at, { cost: i.kwh * 0.1, components: {} }));
+      return answers;
+    });
+    energyContract.externalIntegration = { priceEnergyContract };
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 2, created_at: new Date('2025-08-27T23:00:00.000Z') }, // the day before
+      { value: 5, created_at: new Date('2025-08-28T09:30:00.000Z') }, // 09:00 interval, before the window
+      { value: 3, created_at: new Date('2025-08-28T10:30:00.000Z') }, // 10:00 interval, in the window
+    ]);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T10:00:00.000Z'));
+    expect(priceEnergyContract.callCount).to.equal(1);
+    const [, payload] = priceEnergyContract.firstCall.args;
+    expect(payload.intervals.map((i) => i.starts_at)).to.deep.equal(['2025-08-28T10:00:00.000Z']);
+    // the plug's own consumption before 10:00: 5 kWh today, 7 kWh this month and period
+    expect(payload.cumulative_before).to.deep.equal({ day: 5, month: 7, billing_period: 7 });
+    expect((await costStates()).map((s) => s.value)).to.deep.equal([0.3]);
+  });
+
+  it('should count the fallback warnings of a calendar price', async () => {
+    await energyContract.declareCalendar({ key: 'spot', granularity: 'thirty_minutes' }, TEST_SERVICE_ID);
+    await energyContract.create(
+      contractPayload({
+        name: 'Spot',
+        tariff: {
+          tariff_version: 1,
+          calendars: ['spot'],
+          components: [
+            { key: 'e', kind: 'consumption', rules: [{ price_from_calendar: 'spot' }], fallback: { price: 0.3 } },
+          ],
+        },
+      }),
+    );
+    const warn = sinon.stub(logger, 'warn');
+    await db.duckDbBatchInsertState(PLUG_CONSUMPTION_ID, [
+      { value: 1, created_at: new Date('2025-08-28T15:00:00.000Z') },
+    ]);
+    // the real job manager: the count must pass the data schema of the job type
+    const jobManager = new Job({ emit: fake(), on: fake() });
+    const costJob = await jobManager.start(JOB_TYPES.ENERGY_MONITORING_COST_CALCULATION_CONTRACT);
+    gladys.job.updateProgress = (...args) => jobManager.updateProgress(...args);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T00:00:00.000Z'), costJob.id);
+    expect((await costStates())[0].value).to.equal(0.3);
+    expect(
+      warn.args.some(([message]) => /1 interval\(s\) priced by a fallback \(calendar_missing\)/.test(message)),
+    ).to.equal(true);
+    // counted on the job for the Jobs page
+    expect((await db.Job.findByPk(costJob.id)).data).to.deep.equal({ fallback_prices_count: 1 });
+  });
+
+  it('should skip the features without a cost feature, a broken hierarchy and log errors', async () => {
+    await energyContract.create(contractPayload());
+    await device.create({
+      id: 'e1b2c3d4-e5f6-7890-abcd-ef1234567891',
+      service_id: TEST_SERVICE_ID,
+      name: 'No cost',
+      external_id: 'no-cost',
+      features: [
+        feature({
+          id: 'f2c3d4e5-f6a7-8901-bcde-f12345678902',
+          selector: 'no-cost-consumption',
+          external_id: 'no-cost-consumption',
+          name: 'Consumption',
+          type: DEVICE_FEATURE_TYPES.ENERGY_SENSOR.THIRTY_MINUTES_CONSUMPTION,
+          energy_parent_id: METER_FEATURE_ID,
+        }),
+        feature({
+          id: 'f2c3d4e5-f6a7-8901-bcde-f12345678903',
+          selector: 'no-cost-daily',
+          external_id: 'no-cost-daily',
+          name: 'Daily',
+          type: DEVICE_FEATURE_TYPES.ENERGY_SENSOR.DAILY_CONSUMPTION,
+          energy_parent_id: METER_FEATURE_ID,
+        }),
+      ],
+    });
+    const plug = device.stateManager.get('deviceById', POWER_PLUG_ID);
+    expect(findConsumptionCostPairs(plug)).to.have.lengthOf(1);
+    expect(
+      findConsumptionCostPairs(device.stateManager.get('deviceById', 'e1b2c3d4-e5f6-7890-abcd-ef1234567891')),
+    ).to.deep.equal([]);
+    // an error on one device does not stop the run
+    const error = sinon.stub(logger, 'error');
+    const getDeviceFeatureStates = sinon.stub(device, 'getDeviceFeatureStates').rejects(new Error('boom'));
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T00:00:00.000Z'));
+    expect(error.callCount).to.be.above(0);
+    getDeviceFeatureStates.restore();
+    // broken hierarchy: the meter feature the plug consumption points to is gone
+    const warn = sinon.stub(logger, 'warn');
+    device.stateManager.deleteState('deviceFeatureById', METER_FEATURE_ID);
+    await energyMonitoring.calculateCostFrom(new Date('2025-08-28T00:00:00.000Z'));
+    expect(warn.args.some(([message]) => /no valid root electric meter found/.test(message))).to.equal(true);
+  });
+});
